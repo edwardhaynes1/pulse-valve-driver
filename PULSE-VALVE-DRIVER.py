@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-GYGER-DRIVER.py
+PULSE-VALVE-DRIVER.py
 ===============
 Logs upstream pressure and temperature from a Keller PAA-23SX-H2 sensor,
-and allows manual *and* automatic (independent) control of a Gyger ZC1
-valve controller (SMLD 300GR).
+and allows manual *and* automatic (independent) control of a ZC1 pulse valve controller.
 
 This version presents a TWO-WINDOW GUI (Tkinter, standard library):
   • "Live Log"      — device status, live readouts, pressure strip chart,
@@ -16,7 +15,7 @@ This version presents a TWO-WINDOW GUI (Tkinter, standard library):
 Hardware
 --------
   Keller PAA-23SX-H2   RS485/USB (K-114 adapter) — upstream P + T
-  Gyger ZC1            USB-RS232 — pulse valve control
+  ZC1 controller       USB-RS232 — pulse valve control
   LabJack U3 (opt.)    vacuum chamber gauge on FIO2
 
 CSV columns
@@ -32,7 +31,7 @@ Logging cadence
 
 Usage
 -----
-  python GYGER-DRIVER.py
+  python PULSE-VALVE-DRIVER.py
 """
 
 import serial
@@ -100,14 +99,14 @@ def _make_log_path():
     base = datetime.now().strftime('%Y%m%d_%H%M%S')
     for attempt in range(100):
         suffix = "" if attempt == 0 else f"_{attempt}"
-        path = os.path.join(LOG_DIR, f"gyger_drive_{base}{suffix}.csv")
+        path = os.path.join(LOG_DIR, f"pvd-sensor_{base}{suffix}.csv")
         try:
             fh = open(path, 'x', newline='')
             fh.close()
             return path
         except (PermissionError, FileExistsError):
             continue
-    return f"gyger_drive_{base}.csv"
+    return f"pvd-sensor_{base}.csv"
 
 
 LOG_FILE = _make_log_path()
@@ -552,41 +551,39 @@ def valve_drive_thread():
 # ═══════════════════════════════════════════════════════════════════════════════
 # CSV LOGGING THREAD  — drift-free 0.5 s cadence, immediate first row
 #
-# Two output files per session:
-#   gyger_drive_<ts>.csv       — periodic sensor rows (0.5 s cadence)
-#   gyger_pulses_<ts>.csv      — one row per pulse, microsecond timestamp
+# One output file per session: pvd-sensor_<ts>.csv
 #
-# Sensor row columns:
+# Each row covers one LOG_INTERVAL_S window. Pulse events that occurred during
+# the window are embedded as semicolon-separated values in the pulse_* columns
+# so that everything needed for analysis is in a single file.
+#
+# Columns:
 #   timestamp, keller_pressure_bar (mean), keller_temperature_degC (mean),
-#   vacuum_chamber_mbar, pulses_interval, pulses_total, open_time_us,
-#   n_keller_samples
-#
-# Pulse log columns:
-#   timestamp_us, open_time_us, ack_ok
+#   n_keller_samples, vacuum_chamber_mbar, pulses_interval, pulses_total,
+#   open_time_us, pulse_timestamps_us, pulse_open_times_us, pulse_acks
 # ═══════════════════════════════════════════════════════════════════════════════
 
-PULSE_LOG_FILE = LOG_FILE.replace('gyger_drive_', 'gyger_pulses_')
-
-
 def logger_thread():
-    with open(LOG_FILE, 'a', newline='') as sf,          open(PULSE_LOG_FILE, 'a', newline='') as pf:
+    with open(LOG_FILE, 'a', newline='') as f:
+        writer = csv.writer(f)
 
-        sensor_writer = csv.writer(sf)
-        pulse_writer  = csv.writer(pf)
-
-        sensor_writer.writerow([
+        # Each periodic row covers one LOG_INTERVAL_S window.
+        # pulse_timestamp_us / pulse_open_us / pulse_ack: comma-separated values
+        # when one or more pulses fired in the interval, empty otherwise.
+        writer.writerow([
             'timestamp',
-            'keller_pressure_bar',      # mean over interval (None if no samples)
-            'keller_temperature_degC',  # mean over interval (None if no samples)
-            'n_keller_samples',         # how many Keller samples were averaged
+            'keller_pressure_bar',     # mean over interval (None if no samples)
+            'keller_temperature_degC', # mean over interval (None if no samples)
+            'n_keller_samples',        # number of samples averaged
             'vacuum_chamber_mbar',
             'pulses_interval',
             'pulses_total',
             'open_time_us',
+            'pulse_timestamps_us',     # semicolon-separated microsecond timestamps
+            'pulse_open_times_us',     # semicolon-separated open times
+            'pulse_acks',              # semicolon-separated 1/0 ack flags
         ])
-        pulse_writer.writerow(['timestamp_us', 'open_time_us', 'ack_ok'])
-        sf.flush()
-        pf.flush()
+        f.flush()
 
         start = time.time()
         n = 0
@@ -610,13 +607,19 @@ def logger_thread():
                 _state['pulse_events'] = []
 
             ts = datetime.now().isoformat(timespec='milliseconds')
-            sensor_writer.writerow([ts, p_mean, t_mean, n_k, vac, p_int, p_tot, ot])
-            sf.flush()
 
-            for evt_ts, evt_ot, evt_ok in events:
-                pulse_writer.writerow([evt_ts, evt_ot, 1 if evt_ok else 0])
             if events:
-                pf.flush()
+                pulse_ts   = ';'.join(e[0] for e in events)
+                pulse_ots  = ';'.join(str(e[1]) for e in events)
+                pulse_acks = ';'.join('1' if e[2] else '0' for e in events)
+            else:
+                pulse_ts = pulse_ots = pulse_acks = ''
+
+            writer.writerow([
+                ts, p_mean, t_mean, n_k, vac, p_int, p_tot, ot,
+                pulse_ts, pulse_ots, pulse_acks,
+            ])
+            f.flush()
 
             n += 1
             target = start + n * LOG_INTERVAL_S
@@ -640,7 +643,7 @@ WARN   = "#ff4040"
 GRID   = "#1a1a1a"
 
 
-class GygerGUI:
+class PVDGui:
     """
     Window 1 — Live Log    : text readouts + pressure chart
     Window 2 — Valve Driver: terminal prompt, type commands
@@ -653,7 +656,7 @@ class GygerGUI:
 
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("GYGER-DRIVER  —  Live Log")
+        self.root.title("PVD — Live Log")
         self.root.configure(bg=BG)
         self.root.protocol("WM_DELETE_WINDOW", self.shutdown)
 
@@ -705,7 +708,7 @@ class GygerGUI:
     # ── window 2: driver terminal ───────────────────────────────────────────
     def _build_driver_window(self):
         win = tk.Toplevel(self.root)
-        win.title("GYGER-DRIVER  —  Valve Driver")
+        win.title("PVD — Valve Driver")
         win.configure(bg=BG)
         win.protocol("WM_DELETE_WINDOW", self.shutdown)
         win.geometry("+730+80")
@@ -741,8 +744,8 @@ class GygerGUI:
         self.cmd_entry.bind("<Return>", lambda e: self._on_cmd())
         self.cmd_entry.focus_set()
 
-        self._driver_print("GYGER-DRIVER  —  Valve Driver")
-        self._driver_print("SMLD 300GR · Gyger ZC1")
+        self._driver_print("PVD — Valve Driver")
+        self._driver_print("Pulse Valve Driver · ZC1 controller")
         self._driver_print("")
         self._driver_print("  v          fire one pulse")
         self._driver_print("  t <µs>     set open time")
@@ -884,7 +887,7 @@ class GygerGUI:
         st = self.status_text
         st.configure(state="normal")
         st.delete("1.0", "end")
-        st.insert("end", "GYGER-DRIVER\n", "bright")
+        st.insert("end", "PULSE-VALVE-DRIVER\n", "bright")
         for lbl, ok, avail in (
             (f"[KELLER:{'OK' if _keller_ok else '--'}]",  _keller_ok,  True),
             (f"[VACUUM:{'OK' if _labjack_ok else '--'}]", _labjack_ok, LABJACK_AVAILABLE),
@@ -931,8 +934,7 @@ class GygerGUI:
                 _zc1_serial.close()
         except Exception:
             pass
-        print(f"Sensor log: {LOG_FILE}")
-        print(f"Pulse log:  {PULSE_LOG_FILE}")
+        print(f"Log saved: {LOG_FILE}")
         try:
             self.root.destroy()
         except Exception:
@@ -949,7 +951,7 @@ class GygerGUI:
 def main():
     global _zc1_serial, _zc1_ok, _keller_ok
 
-    print("\nGYGER-DRIVER — startup")
+    print("\nPULSE-VALVE-DRIVER — startup")
     print("─" * 50)
 
     print("Scanning for Keller sensor...")
@@ -958,7 +960,7 @@ def main():
     if not _keller_ok:
         print("  [Keller] NOT FOUND — pressure/temperature will be blank.")
 
-    print("Scanning for Gyger ZC1...")
+    print("Scanning for ZC1 controller...")
     zc1_port, _zc1_serial = _detect_zc1()
     _zc1_ok = _zc1_serial is not None
     if _zc1_ok:
@@ -988,7 +990,7 @@ def main():
         log_event(f"ZC1 online · {zc1_port}")
 
     # ── GUI runs on the main thread ────────────────────────────────────────
-    GygerGUI().run()
+    PVDGui().run()
 
 
 if __name__ == '__main__':
