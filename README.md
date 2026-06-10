@@ -6,6 +6,12 @@ Designed for gas handling characterisation work: fire single calibrated pulses t
 
 ---
 
+## Experiment setup
+
+![Experiment setup](docs/experiment-setup.png)
+
+---
+
 ## Features
 
 - Single-shot pulse valve control via ZC1 controller over RS-232/USB
