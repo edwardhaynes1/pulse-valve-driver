@@ -10,6 +10,9 @@ Designed for gas handling characterisation work: fire single calibrated pulses t
 
 ![Experiment setup](docs/experiment-setup.png)
 
+N₂ supply → isolation valve → **pressurised volume** (upstream pressure sensor) → 
+isolation valve → **pulse valve** → vacuum chamber (downstream pressure sensor + turbopump).
+
 ---
 
 ## Features
