@@ -2,7 +2,7 @@
 
 Python driver for serial pulse valve systems with real-time pressure and temperature logging.
 
-Designed for gas handling characterisation work: fire single calibrated pulses through a pulse valve, log upstream pressure and vacuum chamber pressure, and export timestamped CSV data for post-processing.
+Designed for gas handling characterisation work: fire single calibrated pulses through a pulse valve, log upstream pressure, upstream temperature, and vacuum chamber pressure, and export timestamped CSV data for post-processing.
 
 ---
 
@@ -17,9 +17,10 @@ Designed for gas handling characterisation work: fire single calibrated pulses t
 - Single-shot pulse valve control via ZC1 controller over RS-232/USB
 - Real-time upstream pressure and temperature logging (Keller PAA series)
 - Vacuum chamber pressure logging via LabJack U3 (log-linear gauge)
-- Dual CSV export: periodic sensor rows and per-pulse event log with microsecond timestamps
-- Auto-detection of serial devices on any COM port with reconnection on disconnect
-- Two-window Tkinter GUI: live readouts, pressure strip chart, and valve driver terminal
+- Single timestamped CSV with per-pulse events embedded inline (microsecond resolution)
+- Auto-detection of serial devices on any COM port, with automatic reconnection if a device disconnects mid-session
+- Tkinter GUI: live readouts, three synchronised strip charts (upstream pressure, upstream temperature, vacuum chamber), and a valve driver terminal
+- Companion tools for plotting logs and diagnosing the vacuum gauge
 
 ---
 
@@ -36,10 +37,10 @@ Designed for gas handling characterisation work: fire single calibrated pulses t
 ## Requirements
 
 ```
-pip install pyserial keller-protocol LabJackPython
+pip install pyserial keller-protocol LabJackPython matplotlib
 ```
 
-LabJackPython is optional — the driver runs without it if no vacuum gauge is connected.
+LabJackPython is optional — the driver runs without it if no vacuum gauge is connected. `matplotlib` is only needed for the log plotter, not the driver itself.
 
 ---
 
@@ -57,32 +58,45 @@ python PULSE-VALVE-DRIVER.py
 | `t <µs>` | Set open time (50 – 5 000 000 µs) |
 | `q` | Quit |
 
+The open time in force is shown in the driver window and recorded in every CSV row, so pulses fired at different open times are distinguishable in the log.
+
 ---
 
 ## Output
 
-Two CSV files are written to a `logs/` folder on each run:
+One CSV file is written to a `logs/` folder on each run:
 
-**`pvd-sensor_<timestamp>.csv`** — sensor readings at 0.5 s cadence
+**`pvd-sensor_<timestamp>.csv`** — sensor readings at the configured cadence, with pulse events embedded in the row covering the interval they occurred in.
 
 | Column | Description |
 |---|---|
 | `timestamp` | ISO 8601 |
-| `keller_pressure_bar` | Mean upstream pressure over interval |
-| `keller_temperature_degC` | Mean temperature over interval |
-| `n_keller_samples` | Number of samples averaged |
+| `keller_pressure_bar` | Mean upstream pressure over interval (blank if no samples) |
+| `keller_temperature_degC` | Mean upstream temperature over interval (blank if no samples) |
+| `n_keller_samples` | Number of Keller samples averaged for the row |
 | `vacuum_chamber_mbar` | Vacuum gauge reading |
 | `pulses_interval` | Pulses fired since last row |
 | `pulses_total` | Cumulative pulse count |
-| `open_time_us` | Valve open time setting |
+| `open_time_us` | Valve open-time setting |
+| `pulse_timestamps_us` | Semicolon-separated microsecond timestamps of any pulses in this interval (blank if none) |
+| `pulse_open_times_us` | Semicolon-separated open times for those pulses |
+| `pulse_acks` | Semicolon-separated ACK flags (1 = ZC1 acknowledged, 0 = no response) |
 
-**`pvd-pulses_<timestamp>.csv`** — one row per pulse
+Rows with no pulse in their interval leave the three `pulse_*` columns blank, so filtering to pulse rows is simply a matter of selecting rows where `pulse_timestamps_us` is non-empty.
 
-| Column | Description |
-|---|---|
-| `timestamp_us` | Microsecond-resolution ISO 8601 |
-| `open_time_us` | Open time used for this pulse |
-| `ack_ok` | 1 if ZC1 acknowledged, 0 if no response |
+---
+
+## Companion tools
+
+**`PULSE-VALVE-LOG-PLOTTER.py`** — overlay plot of a session. Run with no arguments to open a file picker, or pass a CSV directly. Plots upstream pressure and temperature (top panel, twin axes), vacuum chamber pressure (bottom panel, log scale), and pulse events as vertical markers across both.
+
+```bash
+python PULSE-VALVE-LOG-PLOTTER.py                 # pick a file, plot whole session
+python PULSE-VALVE-LOG-PLOTTER.py log.csv --zoom  # crop to around the pulses
+python PULSE-VALVE-LOG-PLOTTER.py log.csv --open-time 90   # optional: one open-time only
+```
+
+**`VACUUM-DIAG.py`** — standalone diagnostic for the vacuum gauge on FIO2. Prints raw voltage and converted pressure, and flags ADC saturation or a floating input.
 
 ---
 

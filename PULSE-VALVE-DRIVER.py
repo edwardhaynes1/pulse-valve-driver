@@ -128,7 +128,9 @@ _state       = dict(
     pulse_events                = [],
 )
 _events      = deque(maxlen=200)                          # (timestamp, text)
-_chart       = deque(maxlen=CHART_SECONDS * KELLER_POLL_HZ)  # recent pressures
+_chart       = deque(maxlen=CHART_SECONDS * KELLER_POLL_HZ)     # recent upstream pressures
+_temp_chart  = deque(maxlen=CHART_SECONDS * KELLER_POLL_HZ)     # recent upstream temperatures
+_vac_chart   = deque(maxlen=CHART_SECONDS * LABJACK_SAMPLE_HZ)  # recent vacuum readings
 _zc1_serial  = None
 _zc1_ok      = False
 _keller_ok   = False
@@ -227,6 +229,7 @@ def keller_thread(initial_port: str, initial_bus):
                         _chart.append(p1)
                     if tob1 is not None:
                         _state['keller_temperature_samples'].append(round(tob1, 2))
+                        _temp_chart.append(tob1)
                 _stop.wait(timeout=max(0.0, interval - (time.time() - t0)))
 
         except Exception as e:
@@ -287,7 +290,8 @@ def labjack_thread():
                     raw  = lj.getAIN(LABJACK_FIO2_CHANNEL)
                     mbar = _voltage_to_vacuum_mbar(raw)
                     with _lock:
-                        _state['vacuum_chamber_mbar'] = round(mbar, 6)
+                        _state['vacuum_chamber_mbar'] = mbar
+                        _vac_chart.append(mbar)
                 except Exception as e:
                     log_event(f"LabJack read error: {e}")
                     break   # drop to finally → reconnect
@@ -658,6 +662,7 @@ class PVDGui:
         self.root = tk.Tk()
         self.root.title("PVD — Live Log")
         self.root.configure(bg=BG)
+        self.root.geometry("640x800")
         self.root.protocol("WM_DELETE_WINDOW", self.shutdown)
 
         M = ("Consolas", "Menlo", "Courier New", "DejaVu Sans Mono", "monospace")
@@ -687,12 +692,24 @@ class PVDGui:
         self.status_text.tag_config("ok",     foreground=BRIGHT)
         self.status_text.tag_config("err",    foreground=WARN)
 
-        # chart
-        tk.Label(outer, text=f"─── pressure  last {CHART_SECONDS}s",
+        # charts
+        tk.Label(outer, text=f"─── upstream pressure (bar)  last {CHART_SECONDS}s",
                  font=self.f, fg=DIM, bg=BG, anchor="w").pack(fill="x")
-        self.canvas = tk.Canvas(outer, bg=BG, height=120,
+        self.canvas = tk.Canvas(outer, bg=BG, height=100,
                                 highlightbackground=BORDER, highlightthickness=1)
         self.canvas.pack(fill="both", expand=True)
+
+        tk.Label(outer, text=f"─── upstream temperature (°C)  last {CHART_SECONDS}s",
+                 font=self.f, fg=DIM, bg=BG, anchor="w").pack(fill="x")
+        self.temp_canvas = tk.Canvas(outer, bg=BG, height=100,
+                                     highlightbackground=BORDER, highlightthickness=1)
+        self.temp_canvas.pack(fill="both", expand=True)
+
+        tk.Label(outer, text=f"─── vacuum chamber (mbar, log)  last {CHART_SECONDS}s",
+                 font=self.f, fg=DIM, bg=BG, anchor="w").pack(fill="x")
+        self.vac_canvas = tk.Canvas(outer, bg=BG, height=100,
+                                    highlightbackground=BORDER, highlightthickness=1)
+        self.vac_canvas.pack(fill="both", expand=True)
 
         # event log
         tk.Label(outer, text="─── event log",
@@ -832,32 +849,55 @@ class PVDGui:
         self._update_hint()
 
     # ── chart drawing ───────────────────────────────────────────────────────
-    def _draw_chart(self, data):
-        c = self.canvas
+    def _draw_chart(self, canvas, data, fmt="{:.3f}", log=False):
+        """Draw a strip chart on *canvas*.
+
+        data : sequence of values (oldest → newest)
+        fmt  : format string for the y-axis tick labels
+        log  : if True, plot log10 of the data (for vacuum pressure, which
+               spans orders of magnitude). Non-positive values are skipped.
+        """
+        c = canvas
         c.delete("all")
         w = c.winfo_width() or 580
-        h = c.winfo_height() or 120
-        pad_l, pad_r, pad_y = 52, 8, 6
+        h = c.winfo_height() or 100
+        pad_l, pad_r, pad_y = 62, 8, 6
+
         for i in range(1, 4):
             y = pad_y + (h - 2 * pad_y) * i / 4
             c.create_line(pad_l, y, w - pad_r, y, fill=GRID)
+
         if len(data) < 2:
             c.create_text(w / 2, h / 2, text="waiting for data",
                           fill=DIM, font=self.f)
             return
-        lo, hi = min(data), max(data)
+
+        if log:
+            plot_vals = [math.log10(v) for v in data if v is not None and v > 0]
+        else:
+            plot_vals = [v for v in data if v is not None]
+        if len(plot_vals) < 2:
+            c.create_text(w / 2, h / 2, text="waiting for data",
+                          fill=DIM, font=self.f)
+            return
+
+        lo, hi = min(plot_vals), max(plot_vals)
         if hi - lo < 1e-9:
             lo -= 0.5
             hi += 0.5
         span = hi - lo
-        n = len(data)
+        n = len(plot_vals)
+
         for i in range(5):
             frac = i / 4
             y = (h - pad_y) - (h - 2 * pad_y) * frac
-            c.create_text(pad_l - 4, y, text=f"{lo + span * frac:.3f}",
+            plot_val = lo + span * frac
+            real_val = (10 ** plot_val) if log else plot_val
+            c.create_text(pad_l - 4, y, text=fmt.format(real_val),
                           fill=DIM, font=self.f, anchor="e")
+
         pts = []
-        for i, v in enumerate(data):
+        for i, v in enumerate(plot_vals):
             x = pad_l + (w - pad_l - pad_r) * i / (n - 1)
             y = (h - pad_y) - (h - 2 * pad_y) * (v - lo) / span
             pts.extend((x, y))
@@ -875,7 +915,9 @@ class PVDGui:
             pint   = _state['pulse_interval']
             rate   = _state['drive_rate_hz']
             ot     = _state['open_time_us']
-            chart  = list(_chart)
+            chart      = list(_chart)
+            temp_chart = list(_temp_chart)
+            vac_chart  = list(_vac_chart)
             events = list(_events)
         driving = _drive_on.is_set()
 
@@ -909,7 +951,9 @@ class PVDGui:
         st.insert("end", f"{ot} µs\n", "bright")
         st.configure(state="disabled")
 
-        self._draw_chart(chart)
+        self._draw_chart(self.canvas,      chart,      fmt="{:.3f}")
+        self._draw_chart(self.temp_canvas, temp_chart, fmt="{:.1f}")
+        self._draw_chart(self.vac_canvas,  vac_chart,  fmt="{:.1e}", log=True)
 
         text = "\n".join(f"> {s}  {m}" for s, m in events[-200:])
         if getattr(self, "_last_log_text", None) != text:
