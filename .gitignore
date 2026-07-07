@@ -1,0 +1,5 @@
+logs/
+plots/
+*.csv
+Thumbs.db
+__pycache__/
