@@ -8,9 +8,12 @@ and allows manual *and* automatic (independent) control of a ZC1 pulse valve con
 This version presents a TWO-WINDOW GUI (Tkinter, standard library):
   • "Live Log"      — device status, live readouts, pressure strip chart,
                       pulse counters, and a scrolling event log.
-  • "Valve Driver"  — fire single shots, set open time, and start/stop an
-                      automatic valve drive at a configurable rate. The
-                      valve runs on its own thread, independent of logging.
+  • "Valve Driver"  — fire single shots, set open time, and run high-rate
+                      pulse captures. A capture streams the chamber gauge at
+                      CAPTURE_RATE_HZ, fires the valve inside the window, and
+                      reports the peak the gauge actually saw — the 10 Hz
+                      monitoring loop cannot resolve a pulse transient and
+                      under-reads the peak by an unknown amount.
 
 Hardware
 --------
@@ -28,6 +31,18 @@ Logging cadence
 ---------------
   One CSV row is written on a drift-free wall-clock cadence of
   LOG_INTERVAL_S seconds (first row written immediately at start).
+
+Driver commands
+---------------
+  v          fire one pulse (no capture)
+  c [n]      capture n pulses at high rate, with a summary after a multi-shot run
+  t <µs>     set open time
+  q          quit
+
+Capture outputs
+---------------
+  logs/pulse_<ts>.csv   one file per shot: full decimated trace, t = 0 at fire,
+                        with peak / dp / integral / tau / S_eff / Q in the header
 
 Usage
 -----
@@ -89,6 +104,35 @@ DRIVE_HZ_MAX       = 200.0      # clamp: fastest auto-drive rate
 
 CHART_SECONDS      = 120        # pressure strip-chart window (s)
 LOG_DIR            = str(Path(__file__).parent / "logs")
+
+# ─── Pulse capture ────────────────────────────────────────────────────────────
+# The 10 Hz monitoring loop samples the chamber gauge every 100 ms. A pulse
+# transient decays with tau = V/S_eff, of order 100 ms, so at 10 Hz the recorded
+# "peak" is whatever the sampler happened to land on — systematically low, by an
+# unknown amount. Capture streams AIN2 in hardware at CAPTURE_RATE_HZ, fires the
+# valve at a known point inside the window, and reports the peak the gauge
+# actually saw.
+#
+# The chamber gauge's own response is ~10 ms above 1e-6 mbar, so 5 kHz
+# oversamples the instrument by ~50x. That is deliberate: the surplus is spent
+# on noise averaging in the decimation step, not on bandwidth.
+# The U3 will not sustain every scan rate at every resolution, and it signals
+# a configuration it cannot meet by erroring on every packet rather than by
+# refusing outright. So the rate is probed at the first capture: the ladder is
+# tried fastest-first and the first clean rate is cached for the session.
+CAPTURE_RATE_LADDER = (5000, 2500, 2000, 1000, 500)   # Hz, fastest first
+CAPTURE_RESOLUTION  = 0        # U3 stream resolution index (0 = best noise)
+CAPTURE_PRE_S       = 1.0      # baseline recorded before the pulse (s)
+CAPTURE_POST_S      = 5.0      # transient + tail recorded after the pulse (s)
+CAPTURE_DECIMATE    = 10       # samples averaged per analysis point
+CAPTURE_SETTLE_S    = 3.0      # pause between shots in a multi-shot run (s)
+
+CHAMBER_VOLUME_L    = 10.0     # estimated chamber volume, for S_eff and Q_pulse
+CHAMBER_LIMIT_MBAR  = 1.0e-6   # the in-chamber limit being demonstrated against
+
+FIT_NOISE_K            = 5.0   # stop the decay fit at this x baseline noise
+FIT_MIN_DYNAMIC_RANGE  = 20.0  # need peak excess this far above the noise floor
+FIT_START_FRAC         = 0.5   # begin the fit once excess falls to this x peak
 # ═══════════════════════════════════════════════════════════════════════════════
 
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -135,6 +179,13 @@ _zc1_serial  = None
 _zc1_ok      = False
 _keller_ok   = False
 _labjack_ok  = False
+
+_capture_request = threading.Event()   # GUI -> LabJack thread: capture now
+_capture_busy    = False               # True while a capture is running
+_capture_pending = 0                   # shots still queued in a multi-shot run
+_capture_runs    = []                  # per-shot summary dicts, this session
+_stream_rate     = None                # probed once, then cached for the session
+_summary_window  = 0                   # shots in the current multi-shot run
 
 
 def log_event(text: str):
@@ -286,6 +337,36 @@ def labjack_thread():
         try:
             while not _stop.is_set():
                 t0 = time.time()
+
+                # ── capture ────────────────────────────────────────────────
+                # Streaming takes exclusive control of the U3, so it has to run
+                # on this thread. Monitoring pauses for the window and resumes
+                # automatically. A multi-shot run re-arms itself here.
+                global _capture_busy, _capture_pending
+                if _capture_request.is_set():
+                    _capture_request.clear()
+                    _capture_busy = True
+                    try:
+                        _run_capture(
+                            lj,
+                            shot_index=None if _capture_pending <= 0 else
+                            len(_capture_runs) + 1)
+                    except Exception as e:
+                        log_event(f"CAPTURE failed ({e}) — reconnecting device")
+                        _capture_busy = False
+                        _capture_pending = 0
+                        break
+                    finally:
+                        _capture_busy = False
+                    if _capture_pending > 0:
+                        _capture_pending -= 1
+                        if _capture_pending > 0:
+                            _stop.wait(timeout=CAPTURE_SETTLE_S)
+                            _capture_request.set()
+                        else:
+                            _summarise_runs(_summary_window)
+                    continue
+
                 try:
                     raw  = lj.getAIN(LABJACK_FIO2_CHANNEL)
                     mbar = _voltage_to_vacuum_mbar(raw)
@@ -477,6 +558,360 @@ def fire_one():
         ot = _state['open_time_us']
         _state['pulse_events'].append((ts, ot, ok))
     return ok, ot
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PULSE CAPTURE  — hardware-streamed transient, valve fired inside the window
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# Sequence, all driven from the LabJack thread because streaming needs exclusive
+# control of the U3:
+#
+#   [-- CAPTURE_PRE_S baseline --][FIRE][-- CAPTURE_POST_S transient + tail --]
+#
+# The valve is fired from a short-lived helper thread. This is not cosmetic:
+# fire_one() blocks until the ZC1 returns its '>' prompt, up to 200 ms, and the
+# U3's stream buffer would overflow if the main capture loop stopped draining
+# packets for that long.
+#
+# What comes out:
+#   peak            — the highest pressure the gauge actually saw
+#   dp              — peak above the pre-pulse baseline
+#   integral        — area under (p - baseline), for the throughput calculation
+#   tau, S_eff      — from the decay tail, if it is clean enough to fit
+#   Q_pulse         — gas per shot, by two independent routes (see below)
+
+def _stream_selftest(lj, rate):
+    """Configure and briefly run the stream at *rate*; True if it is clean.
+
+    The U3 rejects a stream configuration it cannot sustain by flagging an
+    error on every packet rather than by raising, so the only reliable check
+    is to start it and look. Doing this *before* arming the valve matters: a
+    failure discovered mid-capture would mean a pulse fired into a capture
+    that then had to be retried.
+    """
+    try:
+        lj.streamConfig(NumChannels=1,
+                        PChannels=[LABJACK_FIO2_CHANNEL],
+                        NChannels=[31],            # 31 = single-ended vs GND
+                        Resolution=CAPTURE_RESOLUTION,
+                        ScanFrequency=int(rate))
+        lj.streamStart()
+        try:
+            reads = 0
+            for packet in lj.streamData():
+                if packet is None:
+                    continue
+                if packet.get('errors'):
+                    return False
+                reads += 1
+                if reads >= 2:
+                    return True
+        finally:
+            try:
+                lj.streamStop()
+            except Exception:
+                pass
+    except Exception:
+        try:
+            lj.streamStop()
+        except Exception:
+            pass
+        return False
+    return False
+
+
+def _choose_stream_rate(lj):
+    """Find the fastest rate in the ladder the U3 will actually stream.
+
+    Probed once per session and cached. The gauge's own ~10 ms response means
+    anything above a few hundred Hz is oversampling the instrument; the surplus
+    is spent on noise averaging in the decimation step, so dropping a rung of
+    the ladder costs very little.
+    """
+    global _stream_rate
+    if _stream_rate is not None:
+        return _stream_rate
+    for rate in CAPTURE_RATE_LADDER:
+        if _stream_selftest(lj, rate):
+            _stream_rate = rate
+            log_event(f"CAPTURE: stream rate {rate:g} Hz "
+                      f"(analysis {rate/CAPTURE_DECIMATE:g} Hz)")
+            return rate
+        log_event(f"CAPTURE: {rate:g} Hz rejected by the U3 — trying slower")
+    return None
+
+
+def _capture_stream_fire(lj, rate):
+    """Stream AIN2 at *rate*, firing one pulse after CAPTURE_PRE_S.
+
+    Returns (volts, fire_index, fire_ok, open_us, missed).
+    """
+    pre_n   = int(rate * CAPTURE_PRE_S)
+    total_n = int(rate * (CAPTURE_PRE_S + CAPTURE_POST_S))
+
+    volts, missed = [], 0
+    fire_idx, fired = None, {}
+
+    def _fire():
+        fired['ok'], fired['ot'] = fire_one()
+
+    lj.streamConfig(NumChannels=1,
+                    PChannels=[LABJACK_FIO2_CHANNEL],
+                    NChannels=[31],
+                    Resolution=CAPTURE_RESOLUTION,
+                    ScanFrequency=int(rate))
+    fire_thread = None
+    try:
+        lj.streamStart()
+        for packet in lj.streamData():
+            if packet is None:
+                continue
+            if packet.get('errors'):
+                raise RuntimeError(
+                    f"{packet['errors']} bad packets at {rate:g} Hz")
+            missed += packet.get('missed', 0) or 0
+            chunk = packet.get(f'AIN{LABJACK_FIO2_CHANNEL}')
+            if chunk:
+                volts.extend(chunk)
+
+            if fire_idx is None and len(volts) >= pre_n:
+                fire_idx = len(volts)
+                fire_thread = threading.Thread(target=_fire, daemon=True)
+                fire_thread.start()
+
+            if len(volts) >= total_n:
+                break
+    finally:
+        try:
+            lj.streamStop()
+        except Exception:
+            pass
+        if fire_thread is not None:
+            fire_thread.join(timeout=1.0)
+
+    return (volts[:total_n], fire_idx,
+            fired.get('ok', False), fired.get('ot'), missed)
+
+
+def _decimate(values, factor):
+    """Block-average *values* by *factor*, discarding any short final block."""
+    return [sum(values[i:i + factor]) / factor
+            for i in range(0, len(values) - factor + 1, factor)]
+
+
+def _fit_decay(times, mbar, p_base, floor):
+    """Least-squares fit of ln(p - p_base) vs t over the usable tail.
+
+    *floor* is the absolute excess (mbar) below which the signal is no longer
+    trustworthy; the fit stops there.
+
+    Three details that matter.
+
+    The base pressure is subtracted before taking logarithms: as p approaches
+    p_base the raw tail flattens, which reads as a falsely long tau.
+
+    The cutoff is set by baseline *noise*, not baseline *magnitude*. Because
+    p_base is measured from a second of pre-trigger data it is known far more
+    precisely than its own value, so the excess can be followed well below
+    p_base. Cutting off at some multiple of p_base instead would throw away
+    most of the decay — and at a base of 1e-7 with a peak of 4e-7 it would
+    leave nothing to fit at all.
+
+    The fit starts on the falling edge rather than at the maximum: the maximum
+    of a noisy trace sits at a random point near the top, which would drag flat
+    data into the fit. An exponential is scale-free, so starting late costs
+    data but not accuracy.
+    """
+    if not mbar:
+        return None
+    i_peak = max(range(len(mbar)), key=lambda i: mbar[i])
+    peak_excess = mbar[i_peak] - p_base
+    if peak_excess <= floor * FIT_MIN_DYNAMIC_RANGE:
+        return None
+
+    i_start = None
+    for i in range(i_peak, len(mbar)):
+        if (mbar[i] - p_base) <= FIT_START_FRAC * peak_excess:
+            i_start = i
+            break
+    if i_start is None:
+        return None
+
+    xs, ys = [], []
+    for t, p in zip(times[i_start:], mbar[i_start:]):
+        excess = p - p_base
+        if excess <= floor:
+            break
+        xs.append(t)
+        ys.append(math.log(excess))
+    if len(xs) < 10:
+        return None
+
+    n = len(xs)
+    mx, my = sum(xs) / n, sum(ys) / n
+    sxx = sum((x - mx) ** 2 for x in xs)
+    sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    if sxx <= 0 or sxy >= 0:
+        return None
+    slope = sxy / sxx
+    intercept = my - slope * mx
+    ss_res = sum((y - (slope * x + intercept)) ** 2 for x, y in zip(xs, ys))
+    ss_tot = sum((y - my) ** 2 for y in ys)
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
+    return -1.0 / slope, r2, n, xs[0]
+
+
+def _write_capture_csv(times, mbar, meta):
+    """Write one capture to its own CSV; return the path."""
+    stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    path = os.path.join(LOG_DIR, f"pulse_{stamp}.csv")
+    with open(path, 'w', newline='') as f:
+        w = csv.writer(f)
+        for k, v in meta.items():
+            w.writerow([f"# {k}", v])
+        w.writerow(['t_s', 'mbar'])          # t = 0 at the fire command
+        for t, p in zip(times, mbar):
+            w.writerow([f"{t:.5f}", f"{p:.6e}"])
+    return path
+
+
+def _run_capture(lj, shot_index=None):
+    """Capture one pulse, analyse it, save it, and report to the event log."""
+    tag = "" if shot_index is None else f" [{shot_index}]"
+
+    rate = _choose_stream_rate(lj)
+    if rate is None:
+        log_event(f"CAPTURE{tag}: the U3 would not stream at any rate in the "
+                  f"ladder — capture unavailable")
+        return None
+
+    log_event(f"CAPTURE{tag}: streaming "
+              f"{CAPTURE_PRE_S + CAPTURE_POST_S:g} s @ {rate:g} Hz")
+
+    volts, fire_idx, fire_ok, open_us, missed = _capture_stream_fire(lj, rate)
+    if missed:
+        log_event(f"CAPTURE{tag}: {missed} samples missed by the stream")
+    if fire_idx is None or len(volts) < CAPTURE_DECIMATE * 20:
+        log_event(f"CAPTURE{tag}: capture failed - too few samples")
+        return None
+    if not fire_ok:
+        log_event(f"CAPTURE{tag}: WARNING - no ZC1 ack; valve may not have fired")
+
+    dt    = CAPTURE_DECIMATE / rate
+    v_dec = _decimate(volts, CAPTURE_DECIMATE)
+    mbar  = [_voltage_to_vacuum_mbar(v) for v in v_dec]
+    i_fire = fire_idx // CAPTURE_DECIMATE
+    times  = [(i - i_fire) * dt for i in range(len(v_dec))]
+
+    # Baseline from the pre-trigger region, ending a little before the fire so
+    # nothing from the rise leaks into it.
+    guard = max(1, int(0.05 / dt))
+    pre = mbar[:max(1, i_fire - guard)]
+    p_base = sum(pre) / len(pre)
+    # Scatter on the pre-trigger baseline sets how far down the decay can be
+    # followed. p_base itself is averaged over ~1 s, so it is known far better
+    # than any single point.
+    sd_pre = (math.sqrt(sum((p - p_base) ** 2 for p in pre) / len(pre))
+              if len(pre) > 1 else p_base * 0.01)
+    fit_floor = FIT_NOISE_K * sd_pre
+
+    post = mbar[i_fire:]
+    i_pk_rel = max(range(len(post)), key=lambda i: post[i])
+    peak = post[i_pk_rel]
+    t_peak = times[i_fire + i_pk_rel]
+    dp = peak - p_base
+
+    # Integral of the excess over the post-fire window, in mbar*s.
+    integral = sum(max(0.0, p - p_base) for p in post) * dt
+
+    fit = _fit_decay(times[i_fire:], post, p_base, fit_floor)
+    tau = s_eff = None
+    r2 = None
+    if fit:
+        tau, r2, npts, _ = fit
+        s_eff = CHAMBER_VOLUME_L / tau
+
+    # Gas per pulse, two independent routes:
+    #   Q = V * dp          needs the volume, and the true peak
+    #   Q = S_eff * integral needs S_eff, but survives a rounded-off peak
+    # They lean on different estimates, so agreement is a real cross-check.
+    q_peak = CHAMBER_VOLUME_L * dp                      # mbar*L
+    q_int  = s_eff * integral if s_eff else None        # mbar*L
+
+    pct = 100.0 * peak / CHAMBER_LIMIT_MBAR
+    log_event(f"CAPTURE{tag}: peak {peak:.3e} mbar  "
+              f"({pct:.1f}% of {CHAMBER_LIMIT_MBAR:.0e} limit)")
+    log_event(f"CAPTURE{tag}: base {p_base:.3e}  dp {dp:.3e}  "
+              f"t_peak {t_peak*1000:.0f} ms")
+    if tau:
+        log_event(f"CAPTURE{tag}: tau {tau*1000:.1f} ms (r2 {r2:.4f})  "
+                  f"S_eff {s_eff:.1f} L/s")
+        log_event(f"CAPTURE{tag}: Q_pulse {q_int:.3e} mbar.L (integral)  "
+                  f"{q_peak:.3e} (V.dp)")
+        if q_int > 0 and not (0.5 < q_peak / q_int < 2.0):
+            log_event(f"CAPTURE{tag}: routes disagree by "
+                      f"{q_peak/q_int:.1f}x - check V and S_eff")
+    else:
+        log_event(f"CAPTURE{tag}: no clean decay to fit - peak still valid")
+        log_event(f"CAPTURE{tag}: peak excess {dp:.2e} vs noise floor "
+                  f"{fit_floor:.2e} - fire a larger shot to measure tau")
+    if peak >= CHAMBER_LIMIT_MBAR:
+        log_event(f"CAPTURE{tag}: *** PEAK EXCEEDED THE LIMIT ***")
+    if t_peak < 3 * dt:
+        log_event(f"CAPTURE{tag}: peak within {t_peak*1000:.0f} ms of fire - "
+                  f"rise may be gauge-limited, treat peak as a lower bound")
+
+    meta = {
+        'capture_rate_hz': rate,
+        'analysis_rate_hz': 1.0 / dt,
+        'open_time_us': open_us,
+        'zc1_ack': int(bool(fire_ok)),
+        'p_base_mbar': f"{p_base:.6e}",
+        'baseline_sd_mbar': f"{sd_pre:.6e}",
+        'peak_mbar': f"{peak:.6e}",
+        'dp_mbar': f"{dp:.6e}",
+        't_peak_s': f"{t_peak:.4f}",
+        'integral_mbar_s': f"{integral:.6e}",
+        'tau_s': f"{tau:.6f}" if tau else '',
+        'r2': f"{r2:.5f}" if r2 else '',
+        'chamber_volume_l': CHAMBER_VOLUME_L,
+        's_eff_l_s': f"{s_eff:.3f}" if s_eff else '',
+        'q_pulse_mbar_l_integral': f"{q_int:.6e}" if q_int else '',
+        'q_pulse_mbar_l_v_dp': f"{q_peak:.6e}",
+        'samples_missed': missed,
+    }
+    path = _write_capture_csv(times, mbar, meta)
+    log_event(f"CAPTURE{tag}: {os.path.basename(path)}")
+
+    run = dict(meta)
+    run['path'] = path
+    run['peak'] = peak
+    run['tau'] = tau
+    _capture_runs.append(run)
+    return run
+
+
+def _summarise_runs(n_last):
+    """Log mean and spread of the last *n_last* captures."""
+    runs = _capture_runs[-n_last:]
+    peaks = [r['peak'] for r in runs]
+    if len(peaks) < 2:
+        return
+    mean = sum(peaks) / len(peaks)
+    sd = math.sqrt(sum((p - mean) ** 2 for p in peaks) / (len(peaks) - 1))
+    log_event(f"SUMMARY: {len(peaks)} shots  peak {mean:.3e} +/- {sd:.1e} mbar "
+              f"({100*sd/mean:.1f}%)  max {max(peaks):.3e}")
+    taus = [r['tau'] for r in runs if r['tau']]
+    if len(taus) >= 2:
+        tm = sum(taus) / len(taus)
+        tsd = math.sqrt(sum((t - tm) ** 2 for t in taus) / (len(taus) - 1))
+        log_event(f"SUMMARY: tau {tm*1000:.1f} +/- {tsd*1000:.1f} ms  "
+                  f"S_eff {CHAMBER_VOLUME_L/tm:.1f} L/s")
+    worst = max(peaks)
+    log_event(f"SUMMARY: worst-case peak is "
+              f"{100*worst/CHAMBER_LIMIT_MBAR:.1f}% of the "
+              f"{CHAMBER_LIMIT_MBAR:.0e} limit")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -764,7 +1199,8 @@ class PVDGui:
         self._driver_print("PVD — Valve Driver")
         self._driver_print("Pulse Valve Driver · ZC1 controller")
         self._driver_print("")
-        self._driver_print("  v          fire one pulse")
+        self._driver_print("  v          fire one pulse (no capture)")
+        self._driver_print("  c [n]      capture n pulses at high rate")
         self._driver_print("  t <µs>     set open time")
         self._driver_print("  q          quit")
         self._driver_print("")
@@ -782,7 +1218,12 @@ class PVDGui:
     def _update_hint(self):
         with _lock:
             ot = _state['open_time_us']
-        self.hint_var.set(f"open={ot} µs  | v  t <µs>  q")
+        if _capture_busy:
+            self.hint_var.set(f"open={ot} µs  |  CAPTURING…")
+        elif _capture_pending > 0:
+            self.hint_var.set(f"open={ot} µs  |  {_capture_pending} shot(s) queued")
+        else:
+            self.hint_var.set(f"open={ot} µs  | v  c [n]  t <µs>  q")
 
     def _on_cmd(self):
         raw = self.cmd_entry.get().strip()
@@ -802,6 +1243,31 @@ class PVDGui:
             self._driver_print(f"  pulse fired  {ot} µs  {status}",
                                "ok" if ok else "err")
             log_event(f"pulse fired  {ot} µs  {status}")
+
+        elif cmd == "c":
+            global _capture_pending, _summary_window
+            if _capture_busy or _capture_request.is_set():
+                self._driver_print("  capture already running", "err")
+                return
+            if not _labjack_ok:
+                self._driver_print("  no LabJack — capture unavailable", "err")
+                return
+            n = 1
+            if len(parts) > 1:
+                try:
+                    n = max(1, min(50, int(parts[1])))
+                except ValueError:
+                    self._driver_print("  usage: c [n]  (1 – 50 shots)", "err")
+                    return
+            _capture_pending = n
+            _summary_window  = n
+            _capture_request.set()
+            window = CAPTURE_PRE_S + CAPTURE_POST_S
+            total  = n * window + (n - 1) * CAPTURE_SETTLE_S
+            self._driver_print(
+                f"  capture armed — {n} shot(s), ~{total:.0f} s total", "ok")
+            self._driver_print(
+                "  the valve fires automatically inside each window", "dim")
 
         elif cmd in ("d", "r"):
             self._driver_print(
@@ -861,7 +1327,7 @@ class PVDGui:
         c.delete("all")
         w = c.winfo_width() or 580
         h = c.winfo_height() or 100
-        pad_l, pad_r, pad_y = 62, 8, 6
+        pad_l, pad_r, pad_y = 80, 8, 6
 
         for i in range(1, 4):
             y = pad_y + (h - 2 * pad_y) * i / 4
@@ -949,11 +1415,23 @@ class PVDGui:
         st.insert("end", f"total={ptot}  interval={pint}\n", "bright")
         st.insert("end", "OPEN TIME    ", "dim")
         st.insert("end", f"{ot} µs\n", "bright")
+        st.insert("end", "CAPTURE      ", "dim")
+        if _capture_busy:
+            st.insert("end", "running…\n", "bright")
+        elif _capture_runs:
+            last = _capture_runs[-1]
+            pk = last['peak']
+            pct = 100.0 * pk / CHAMBER_LIMIT_MBAR
+            st.insert("end",
+                      f"last peak {pk:.3e} mbar  ({pct:.0f}% of limit)\n",
+                      "err" if pk >= CHAMBER_LIMIT_MBAR else "bright")
+        else:
+            st.insert("end", "none yet\n", "dim")
         st.configure(state="disabled")
 
         self._draw_chart(self.canvas,      chart,      fmt="{:.3f}")
         self._draw_chart(self.temp_canvas, temp_chart, fmt="{:.1f}")
-        self._draw_chart(self.vac_canvas,  vac_chart,  fmt="{:.1e}", log=True)
+        self._draw_chart(self.vac_canvas,  vac_chart,  fmt="{:.3e}", log=True)
 
         text = "\n".join(f"> {s}  {m}" for s, m in events[-200:])
         if getattr(self, "_last_log_text", None) != text:
