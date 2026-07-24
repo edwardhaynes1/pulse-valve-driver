@@ -132,7 +132,19 @@ CHAMBER_LIMIT_MBAR  = 1.0e-6   # the in-chamber limit being demonstrated against
 
 FIT_NOISE_K            = 5.0   # stop the decay fit at this x baseline noise
 FIT_MIN_DYNAMIC_RANGE  = 20.0  # need peak excess this far above the noise floor
-FIT_START_FRAC         = 0.5   # begin the fit once excess falls to this x peak
+FIT_START_FRACTIONS    = (0.7, 0.5, 0.35, 0.25, 0.15)  # candidate fit starts
+FIT_MIN_POINTS         = 20    # minimum points for a candidate fit to count
+
+# --- Pulse detection ---------------------------------------------------------
+# A capture always produces numbers. Without a test for whether anything
+# actually happened, the maximum of a flat noisy trace gets reported as a
+# "peak" - the max of ~1000 normal samples sits ~3 sd above the mean, which
+# on a 5e-7 baseline looks like a plausible small pulse. Two independent
+# tests must pass before a shot is called a detection.
+DETECT_PEAK_K    = 10.0   # peak excess must exceed this x baseline sd
+DETECT_WINDOW_S  = 0.5    # averaging window just after the fire
+DETECT_T_STAT    = 6.0    # window mean must exceed this many standard errors
+FLAT_TRACE_V     = 1e-5   # below this spread in volts the input is not live
 # ═══════════════════════════════════════════════════════════════════════════════
 
 os.makedirs(LOG_DIR, exist_ok=True)
@@ -703,8 +715,7 @@ def _decimate(values, factor):
 def _fit_decay(times, mbar, p_base, floor):
     """Least-squares fit of ln(p - p_base) vs t over the usable tail.
 
-    *floor* is the absolute excess (mbar) below which the signal is no longer
-    trustworthy; the fit stops there.
+    Returns (tau, r2, n_points, t_start, start_frac) or None.
 
     Three details that matter.
 
@@ -714,14 +725,18 @@ def _fit_decay(times, mbar, p_base, floor):
     The cutoff is set by baseline *noise*, not baseline *magnitude*. Because
     p_base is measured from a second of pre-trigger data it is known far more
     precisely than its own value, so the excess can be followed well below
-    p_base. Cutting off at some multiple of p_base instead would throw away
-    most of the decay — and at a base of 1e-7 with a peak of 4e-7 it would
-    leave nothing to fit at all.
+    p_base. Cutting off at a multiple of p_base instead would throw away most
+    of the decay, and at a base of 1e-7 with a peak of 4e-7 would leave
+    nothing to fit at all.
 
-    The fit starts on the falling edge rather than at the maximum: the maximum
-    of a noisy trace sits at a random point near the top, which would drag flat
-    data into the fit. An exponential is scale-free, so starting late costs
-    data but not accuracy.
+    Where the fit *starts* is not a free choice. If gas is still arriving —
+    which it is whenever a conductance limiter stretches the injection over a
+    time comparable to the chamber's own decay — the early tail falls more
+    slowly than the chamber alone would, and a fit that includes it reports a
+    tau that is too long. Start too late instead and the signal has decayed
+    into the noise. So rather than fix a start point, several are tried and
+    the one with the best r-squared wins: a single exponential fits properly
+    only over the region where the chamber is the only thing acting.
     """
     if not mbar:
         return None
@@ -730,36 +745,41 @@ def _fit_decay(times, mbar, p_base, floor):
     if peak_excess <= floor * FIT_MIN_DYNAMIC_RANGE:
         return None
 
-    i_start = None
-    for i in range(i_peak, len(mbar)):
-        if (mbar[i] - p_base) <= FIT_START_FRAC * peak_excess:
-            i_start = i
-            break
-    if i_start is None:
-        return None
+    best = None
+    for start_frac in FIT_START_FRACTIONS:
+        i_start = None
+        for i in range(i_peak, len(mbar)):
+            if (mbar[i] - p_base) <= start_frac * peak_excess:
+                i_start = i
+                break
+        if i_start is None:
+            continue
 
-    xs, ys = [], []
-    for t, p in zip(times[i_start:], mbar[i_start:]):
-        excess = p - p_base
-        if excess <= floor:
-            break
-        xs.append(t)
-        ys.append(math.log(excess))
-    if len(xs) < 10:
-        return None
+        xs, ys = [], []
+        for t, p in zip(times[i_start:], mbar[i_start:]):
+            excess = p - p_base
+            if excess <= floor:
+                break
+            xs.append(t)
+            ys.append(math.log(excess))
+        if len(xs) < FIT_MIN_POINTS:
+            continue
 
-    n = len(xs)
-    mx, my = sum(xs) / n, sum(ys) / n
-    sxx = sum((x - mx) ** 2 for x in xs)
-    sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
-    if sxx <= 0 or sxy >= 0:
-        return None
-    slope = sxy / sxx
-    intercept = my - slope * mx
-    ss_res = sum((y - (slope * x + intercept)) ** 2 for x, y in zip(xs, ys))
-    ss_tot = sum((y - my) ** 2 for y in ys)
-    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
-    return -1.0 / slope, r2, n, xs[0]
+        n = len(xs)
+        mx, my = sum(xs) / n, sum(ys) / n
+        sxx = sum((x - mx) ** 2 for x in xs)
+        sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+        if sxx <= 0 or sxy >= 0:
+            continue
+        slope = sxy / sxx
+        intercept = my - slope * mx
+        ss_res = sum((y - (slope * x + intercept)) ** 2 for x, y in zip(xs, ys))
+        ss_tot = sum((y - my) ** 2 for y in ys)
+        r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
+
+        if best is None or r2 > best[1]:
+            best = (-1.0 / slope, r2, n, xs[0], start_frac)
+    return best
 
 
 def _write_capture_csv(times, mbar, meta):
@@ -822,15 +842,55 @@ def _run_capture(lj, shot_index=None):
     t_peak = times[i_fire + i_pk_rel]
     dp = peak - p_base
 
+    # ---- did anything actually happen? --------------------------------------
+    # Test 1: is the raw input live at all? A disconnected or stuck gauge gives
+    # a near-constant voltage, which would otherwise be analysed as a baseline
+    # with a tiny "pulse" on it.
+    v_lo, v_hi = min(volts), max(volts)
+    trace_live = (v_hi - v_lo) > FLAT_TRACE_V
+
+    # Test 2: peak against baseline noise. On its own this is weak - the
+    # maximum of N noisy samples grows with N - so it is a necessary condition,
+    # not a sufficient one.
+    peak_snr = dp / sd_pre if sd_pre > 0 else 0.0
+
+    # Test 3: the sensitive one. Average the window just after the fire and ask
+    # how many standard errors it sits above the baseline. Averaging n points
+    # shrinks the noise by sqrt(n), so a real pulse scores in the hundreds
+    # while noise scores about 1.
+    n_win = max(5, min(len(post), int(DETECT_WINDOW_S / dt)))
+    win_mean = sum(post[:n_win]) / n_win
+    se = sd_pre / math.sqrt(n_win) if sd_pre > 0 else 0.0
+    t_stat = (win_mean - p_base) / se if se > 0 else 0.0
+
+    detected = (trace_live
+                and peak_snr >= DETECT_PEAK_K
+                and t_stat >= DETECT_T_STAT)
+
     # Integral of the excess over the post-fire window, in mbar*s.
     integral = sum(max(0.0, p - p_base) for p in post) * dt
 
     fit = _fit_decay(times[i_fire:], post, p_base, fit_floor)
-    tau = s_eff = None
-    r2 = None
+    tau = s_eff = r2 = None
+    fit_from = None
     if fit:
-        tau, r2, npts, _ = fit
+        tau, r2, npts, t_fit0, start_frac = fit
         s_eff = CHAMBER_VOLUME_L / tau
+        fit_from = (t_fit0, start_frac)
+
+    # Rise time. For an impulsive injection this is set by the gauge (~10 ms).
+    # Anything much longer means gas is still arriving well after the valve
+    # shut - which is exactly what a conductance limiter is for, but it breaks
+    # the V*dp route to Q_pulse, because not all the gas is ever in the
+    # chamber at once.
+    t10 = t90 = None
+    for t, p in zip(times[i_fire:], post):
+        if t10 is None and p >= p_base + 0.1 * dp:
+            t10 = t
+        if t90 is None and p >= p_base + 0.9 * dp:
+            t90 = t
+            break
+    t_rise = (t90 - t10) if (t10 is not None and t90 is not None) else None
 
     # Gas per pulse, two independent routes:
     #   Q = V * dp          needs the volume, and the true peak
@@ -839,23 +899,79 @@ def _run_capture(lj, shot_index=None):
     q_peak = CHAMBER_VOLUME_L * dp                      # mbar*L
     q_int  = s_eff * integral if s_eff else None        # mbar*L
 
+    # ---- reporting ----------------------------------------------------------
+    if not trace_live:
+        log_event(f"CAPTURE{tag}: *** GAUGE INPUT NOT CHANGING *** "
+                  f"({v_lo:.4f} to {v_hi:.4f} V across the whole window)")
+        log_event(f"CAPTURE{tag}: check the FIO2 wiring and the gauge - "
+                  f"no analysis attempted")
+        _write_capture_csv(times, mbar, {'detected': 0, 'flat_trace': 1,
+                                         'capture_rate_hz': rate,
+                                         'open_time_us': open_us,
+                                         'zc1_ack': int(bool(fire_ok))})
+        return None
+
+    if not detected:
+        log_event(f"CAPTURE{tag}: *** NO PULSE DETECTED ***")
+        log_event(f"CAPTURE{tag}: peak excess {dp:.2e} = {peak_snr:.1f} x noise "
+                  f"(need {DETECT_PEAK_K:g}), window t = {t_stat:.1f} "
+                  f"(need {DETECT_T_STAT:g})")
+        # An upper bound is still a real result: whatever the valve delivered,
+        # it was smaller than this.
+        ub = DETECT_PEAK_K * sd_pre
+        log_event(f"CAPTURE{tag}: upper bound - any dp was below {ub:.2e} mbar "
+                  f"({100*ub/CHAMBER_LIMIT_MBAR:.2f} % of limit)")
+        if not fire_ok:
+            log_event(f"CAPTURE{tag}: the ZC1 did not acknowledge - "
+                      f"the valve probably never fired")
+        else:
+            log_event(f"CAPTURE{tag}: ZC1 acknowledged, so the valve actuated "
+                      f"but delivered no measurable gas - check upstream "
+                      f"pressure and open time against the threshold")
+        meta = {
+            'detected': 0,
+            'capture_rate_hz': rate,
+            'analysis_rate_hz': 1.0 / dt,
+            'open_time_us': open_us,
+            'zc1_ack': int(bool(fire_ok)),
+            'p_base_mbar': f"{p_base:.6e}",
+            'baseline_sd_mbar': f"{sd_pre:.6e}",
+            'peak_snr': f"{peak_snr:.2f}",
+            'detect_t_stat': f"{t_stat:.2f}",
+            'dp_upper_bound_mbar': f"{ub:.6e}",
+            'samples_missed': missed,
+        }
+        path = _write_capture_csv(times, mbar, meta)
+        log_event(f"CAPTURE{tag}: {os.path.basename(path)}")
+        _capture_runs.append(dict(meta, path=path, peak=None, tau=None,
+                                  detected=False))
+        return None
+
     pct = 100.0 * peak / CHAMBER_LIMIT_MBAR
     log_event(f"CAPTURE{tag}: peak {peak:.3e} mbar  "
-              f"({pct:.1f}% of {CHAMBER_LIMIT_MBAR:.0e} limit)")
+              f"({pct:.1f}% of {CHAMBER_LIMIT_MBAR:.0e} limit)  "
+              f"SNR {peak_snr:.0f}")
     log_event(f"CAPTURE{tag}: base {p_base:.3e}  dp {dp:.3e}  "
               f"t_peak {t_peak*1000:.0f} ms")
+    if t_rise is not None:
+        log_event(f"CAPTURE{tag}: rise 10-90% {t_rise*1000:.0f} ms "
+                  f"(valve open {open_us} us)")
     if tau:
-        log_event(f"CAPTURE{tag}: tau {tau*1000:.1f} ms (r2 {r2:.4f})  "
-                  f"S_eff {s_eff:.1f} L/s")
+        log_event(f"CAPTURE{tag}: tau {tau*1000:.1f} ms (r2 {r2:.4f}, "
+                  f"fit from {fit_from[0]*1000:.0f} ms)  S_eff {s_eff:.1f} L/s")
         log_event(f"CAPTURE{tag}: Q_pulse {q_int:.3e} mbar.L (integral)  "
                   f"{q_peak:.3e} (V.dp)")
-        if q_int > 0 and not (0.5 < q_peak / q_int < 2.0):
+        if t_rise is not None and t_rise > 0.15 * tau:
+            log_event(f"CAPTURE{tag}: rise is {100*t_rise/tau:.0f}% of tau - "
+                      f"injection is not impulsive, trust the integral route")
+        elif q_int > 0 and not (0.5 < q_peak / q_int < 2.0):
             log_event(f"CAPTURE{tag}: routes disagree by "
                       f"{q_peak/q_int:.1f}x - check V and S_eff")
     else:
-        log_event(f"CAPTURE{tag}: no clean decay to fit - peak still valid")
+        log_event(f"CAPTURE{tag}: pulse detected but no clean decay to fit")
         log_event(f"CAPTURE{tag}: peak excess {dp:.2e} vs noise floor "
-                  f"{fit_floor:.2e} - fire a larger shot to measure tau")
+                  f"{fit_floor:.2e} - too little range for tau; "
+                  f"peak and dp are still measured")
     if peak >= CHAMBER_LIMIT_MBAR:
         log_event(f"CAPTURE{tag}: *** PEAK EXCEEDED THE LIMIT ***")
     if t_peak < 3 * dt:
@@ -863,6 +979,9 @@ def _run_capture(lj, shot_index=None):
                   f"rise may be gauge-limited, treat peak as a lower bound")
 
     meta = {
+        'detected': 1,
+        'peak_snr': f"{peak_snr:.1f}",
+        'detect_t_stat': f"{t_stat:.1f}",
         'capture_rate_hz': rate,
         'analysis_rate_hz': 1.0 / dt,
         'open_time_us': open_us,
@@ -872,6 +991,9 @@ def _run_capture(lj, shot_index=None):
         'peak_mbar': f"{peak:.6e}",
         'dp_mbar': f"{dp:.6e}",
         't_peak_s': f"{t_peak:.4f}",
+        't_rise_10_90_s': f"{t_rise:.4f}" if t_rise is not None else '',
+        'fit_start_s': f"{fit_from[0]:.4f}" if fit_from else '',
+        'fit_start_frac': fit_from[1] if fit_from else '',
         'integral_mbar_s': f"{integral:.6e}",
         'tau_s': f"{tau:.6f}" if tau else '',
         'r2': f"{r2:.5f}" if r2 else '',
@@ -888,21 +1010,35 @@ def _run_capture(lj, shot_index=None):
     run['path'] = path
     run['peak'] = peak
     run['tau'] = tau
+    run['detected'] = True
     _capture_runs.append(run)
     return run
 
 
 def _summarise_runs(n_last):
-    """Log mean and spread of the last *n_last* captures."""
+    """Log mean and spread of the last *n_last* captures.
+
+    Non-detections are counted but excluded from the statistics - averaging a
+    real pulse together with a shot that delivered nothing would report a
+    meaningless middle value.
+    """
     runs = _capture_runs[-n_last:]
-    peaks = [r['peak'] for r in runs]
+    good = [r for r in runs if r.get('detected')]
+    n_bad = len(runs) - len(good)
+    if n_bad:
+        log_event(f"SUMMARY: {n_bad} of {len(runs)} shots had NO DETECTABLE "
+                  f"PULSE - excluded from the statistics below")
+    if not good:
+        log_event("SUMMARY: no shots delivered a measurable pulse")
+        return
+    peaks = [r['peak'] for r in good]
     if len(peaks) < 2:
         return
     mean = sum(peaks) / len(peaks)
     sd = math.sqrt(sum((p - mean) ** 2 for p in peaks) / (len(peaks) - 1))
     log_event(f"SUMMARY: {len(peaks)} shots  peak {mean:.3e} +/- {sd:.1e} mbar "
               f"({100*sd/mean:.1f}%)  max {max(peaks):.3e}")
-    taus = [r['tau'] for r in runs if r['tau']]
+    taus = [r['tau'] for r in good if r['tau']]
     if len(taus) >= 2:
         tm = sum(taus) / len(taus)
         tsd = math.sqrt(sum((t - tm) ** 2 for t in taus) / (len(taus) - 1))
