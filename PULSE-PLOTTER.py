@@ -12,6 +12,7 @@ One capture:
   • Chamber pressure vs time, t = 0 at the fire command
   • Baseline, peak, dp and time-to-peak marked
   • Rise (10–90 %) and decay-fit regions shaded
+  • S_eff and Q_pulse (both routes) shown in a summary box
 
 Several captures:
   • All traces overlaid on a common time axis, aligned at the fire
@@ -65,10 +66,13 @@ Usage
   --limit MBAR      in-chamber pressure limit (default 1e-6)
   --baseline MODE   drift | mean | all      (default drift)
   --baseline-n N    samples used by --baseline mean (default 125)
-  --xlim T0 T1      time axis limits in seconds (default -0.1 0.7)
+  --xlim T0 T1      time axis limits in seconds
+                    (default: auto — extends to each trace's return to baseline)
   --absolute        plot raw chamber pressure instead of excess
   --no-individual   draw only the group-mean traces
   --logfit          add a log-axis panel of the decay
+  --linear          use the linear excess/absolute view instead of the
+                    default log-pressure axis (baseline → 10⁻⁶ limit)
   --out FILE        save to FILE instead of showing interactively
 
 Shell globs are expanded internally, so `pulse_*.csv` works on Windows too.
@@ -88,12 +92,17 @@ import csv
 
 import matplotlib
 import matplotlib.pyplot as plt
+from matplotlib.ticker import FuncFormatter, NullFormatter
 
 GUARD_S = 0.05          # ignore this much just before the fire
 TAIL_FRAC = 0.75        # far-tail anchor starts this far through the window
 FIT_NOISE_K = 5.0       # stop the decay fit at this × the residual scatter
 FIT_START_FRACTIONS = (0.7, 0.5, 0.35, 0.25, 0.15)
 FIT_MIN_POINTS = 20
+
+# Auto time-window: how far right to draw so the return to baseline is shown.
+RETURN_K = 3.0          # excess is "back to baseline" below this × scatter
+TAIL_MARGIN_S = 0.15    # flat tail to keep past the return, minimum
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -343,7 +352,7 @@ def load_one(path, args):
     """Read one capture, analyse it, and return a record dict."""
     meta, times, mbar = read_capture(path)
     volume = args.volume if args.volume is not None else float(
-        meta.get("chamber_volume_l", 10.0))
+        meta.get("chamber_volume_l", 15.586))
 
     bl = baselines(times, mbar, args.baseline_n)
     base_fn = bl[args.baseline]["fn"]
@@ -474,11 +483,44 @@ C_ANN = "#4a4a4a"
 # Fixed order, so a given open time keeps its colour between runs.
 PALETTE = ["#1f5fd0", "#eb6834", "#1baf7a", "#8e44c9", "#c9a227", "#c0392b"]
 
+_SUP = {"-": "⁻", "0": "⁰", "1": "¹", "2": "²", "3": "³", "4": "⁴",
+        "5": "⁵", "6": "⁶", "7": "⁷", "8": "⁸", "9": "⁹"}
+
+
+def _sup(n):
+    """Unicode superscript of an integer, e.g. -8 -> ⁻⁸."""
+    return "".join(_SUP[c] for c in str(int(n)))
+
+
+def axis_scale(values):
+    """Pick a power-of-ten multiplier from the data's own magnitude.
+
+    A fixed ×10⁻⁷ axis is misleading when the data is ×10⁻⁸ (an excess trace
+    peaking at a few 10⁻⁸ ends up labelled in tenths under a 10⁻⁷ header, so
+    the multiplier reads like a floor the data sits on). Sizing the multiplier
+    to the largest visible value makes the tick numbers match what is plotted.
+    Returns (scale, exponent).
+    """
+    vmax = max((abs(v) for v in values if v is not None), default=0.0)
+    if vmax <= 0 or not math.isfinite(vmax):
+        return 1e-7, -7
+    exp = int(math.floor(math.log10(vmax)))
+    return 10.0 ** exp, exp
+
+
+def _mbar_fmt(v, _pos=None):
+    """Tick label as an absolute pressure, e.g. 2.5×10⁻⁷ or 1.0×10⁻⁶."""
+    if v <= 0:
+        return ""
+    exp = int(math.floor(math.log10(v * 1.0000001)))
+    return f"{v / 10 ** exp:.1f}×10{_sup(exp)}"
+
 
 def plot_single(ax, r, xlim, limit, title_extra=""):
     """Full-detail view of one capture: shaded regions and per-shot marks."""
-    scale = 1e-7
     a, times, mbar, base_fn = r["a"], r["times"], r["mbar"], r["base_fn"]
+    vis_p = [p for t, p in zip(times, mbar) if xlim[0] <= t <= xlim[1]] or mbar
+    scale, exp = axis_scale(vis_p)
 
     if a["t10"] is not None and a["t90"] is not None:
         ax.axvspan(a["t10"], a["t90"], color=C_RISE, alpha=0.13, lw=0,
@@ -520,8 +562,26 @@ def plot_single(ax, r, xlim, limit, title_extra=""):
             f"time to peak  {a['t_peak']*1000:.0f} ms",
             ha="center", fontsize=10, color=C_ANN)
 
+    # ── S_eff / Q_pulse summary box ──────────────────────────────────────
+    # Computed in analyse() and otherwise only reaching the console; put the
+    # headline throughput numbers on the figure too. Both Q routes are shown:
+    # they agree only when the injection is impulsive, so seeing them side by
+    # side is the cross-check.
+    vol = r["volume"]
+    if a.get("fit"):
+        box = (f"S_eff   {a['s_eff']:.1f} L/s   (V/τ,  V = {vol:g} L)\n"
+               f"Q_pulse {a['q_int']:.3e} mbar·L   (S_eff × ∫)\n"
+               f"        {a['q_vdp']:.3e} mbar·L   (V × Δp)")
+    else:
+        box = (f"Q_pulse {a['q_vdp']:.3e} mbar·L   (V × Δp)\n"
+               f"no decay fit — S_eff / integral route unavailable")
+    ax.text(0.985, 0.04, box, transform=ax.transAxes, ha="right", va="bottom",
+            fontsize=9, color="#111111", family="monospace", zorder=6,
+            bbox=dict(boxstyle="round,pad=0.5", fc="white", ec=C_ANN,
+                      lw=0.8, alpha=0.9))
+
     ax.set_xlabel("Time from valve fire (s)")
-    ax.set_ylabel("Chamber pressure  (×10⁻⁷ mbar)")
+    ax.set_ylabel(f"Chamber pressure  (×10{_sup(exp)} mbar)")
     ax.grid(True, alpha=0.25)
     for sp in ("top", "right"):
         ax.spines[sp].set_visible(False)
@@ -539,9 +599,20 @@ def plot_overlay(ax, groups, stats, xlim, limit, use_excess,
     the GROUP MEAN, since with several shots per setting no single trace is
     the answer.
     """
-    scale = 1e-7
-    ylabel = ("Excess above baseline  (×10⁻⁷ mbar)" if use_excess
-              else "Chamber pressure  (×10⁻⁷ mbar)")
+    # Size the axis multiplier to the data (pre-pass over visible values),
+    # so an excess overlay in the 10⁻⁸ range is not labelled under a 10⁻⁷
+    # header that reads like a floor.
+    scan = []
+    for key, recs in groups:
+        for r in recs:
+            if not r["detected"]:
+                continue
+            ys = ([p - r["base_fn"](t) for t, p in zip(r["times"], r["mbar"])]
+                  if use_excess else r["mbar"])
+            scan += [y for t, y in zip(r["times"], ys) if xlim[0] <= t <= xlim[1]]
+    scale, exp = axis_scale(scan)
+    kind = "Excess above baseline" if use_excess else "Chamber pressure"
+    ylabel = f"{kind}  (×10{_sup(exp)} mbar)"
 
     lo_v, hi_v = [], []
     for gi, (key, recs) in enumerate(groups):
@@ -590,6 +661,25 @@ def plot_overlay(ax, groups, stats, xlim, limit, use_excess,
 
     if use_excess:
         ax.axhline(0.0, color=C_BASE, ls="--", lw=1.0, zorder=1)
+        # The zero line IS the baseline. In excess mode that is not zero
+        # pressure — the trace rests on a real background of ~10⁻⁷ mbar — so
+        # label the line with its absolute value, otherwise "0" under the axis
+        # multiplier reads as the pressure itself.
+        bl_vals = [r["base_fn"](0.0) for _, recs in groups for r in recs
+                   if r["detected"]]
+        if bl_vals:
+            bl_mean = sum(bl_vals) / len(bl_vals)
+            spread = (max(bl_vals) - min(bl_vals)) if len(bl_vals) > 1 else 0.0
+            note = f"0 = baseline  {bl_mean:.3e} mbar"
+            if spread > 0.02 * bl_mean:
+                note += f"  (shots vary ±{spread/2:.1e})"
+            ax.annotate(note, xy=(0.985, 0.0),
+                        xycoords=("axes fraction", "data"),
+                        xytext=(0, 5), textcoords="offset points",
+                        color=C_BASE, fontsize=9, ha="right", va="bottom",
+                        zorder=5,
+                        bbox=dict(boxstyle="round,pad=0.3", fc="white",
+                                  ec="none", alpha=0.85))
     ax.axvline(0.0, color=C_FIRE, lw=1.4, zorder=3)
     ax.annotate("valve fires  (t = 0)", xy=(0, 0.06),
                 xycoords=("data", "axes fraction"),
@@ -612,6 +702,10 @@ def plot_overlay(ax, groups, stats, xlim, limit, use_excess,
         parts.append(f"t_peak {g['t_peak'][0]*1000:.0f} ms")
         if g.get("tau") and g["tau"][0] is not None:
             parts.append(f"τ {g['tau'][0]*1000:.0f} ms")
+        if g.get("s_eff") and g["s_eff"][0] is not None:
+            parts.append(f"S_eff {g['s_eff'][0]:.0f} L/s")
+        if g.get("q_int") and g["q_int"][0] is not None:
+            parts.append(f"Q_pulse {g['q_int'][0]:.2e} mbar·L")
         ax.annotate("\n".join(parts), xy=(tp, yv),
                     xytext=(18, 6 + 4 * gi), textcoords="offset points",
                     fontsize=9, color=colour,
@@ -662,6 +756,119 @@ def plot_logpanel(ax, groups, stats, use_excess):
         ax.spines[sp].set_visible(False)
     ax.set_title("Group means on a log axis — a single exponential is a "
                  "straight line", fontsize=12, loc="left")
+    ax.legend(loc="upper right", fontsize=9, framealpha=0.9)
+
+
+def plot_logabs(ax, groups, stats, xlim, limit, title_extra=""):
+    """Absolute chamber pressure on a log y-axis, from baseline to the limit.
+
+    This is the headroom view. Unlike the excess plot, the y-axis reads TRUE
+    pressure: the baseline sits at its own value (~10⁻⁷ mbar) where the excess
+    plot's zero used to be, and the 10⁻⁶ limit is drawn in, so how much margin
+    a pulse leaves is read straight off the axis. Note the decay is NOT a
+    straight line here — that is the excess-log view (--logfit); this view is
+    about absolute level and margin to the limit, not τ.
+    """
+    bl_vals = [r["base_fn"](0.0) for _, recs in groups
+               for r in recs if r["detected"]]
+    bl = sum(bl_vals) / len(bl_vals) if bl_vals else 3.0e-7
+    t0, t1 = xlim
+    vis = []                     # every plotted value in view, for a tight fit
+
+    for gi, (key, recs) in enumerate(groups):
+        colour = PALETTE[gi % len(PALETTE)]
+        g = stats[key]
+        for r in recs:
+            if r["detected"]:
+                ax.plot(r["times"], r["mbar"], color=colour, lw=0.8,
+                        alpha=0.35, zorder=2)
+                vis.extend(p for tt, p in zip(r["times"], r["mbar"])
+                           if t0 <= tt <= t1)
+        grid, mean = resample_mean(recs, use_excess=False)
+        lbl = f"{key} µs  (n = {g['n_good']})"
+        if grid:
+            ax.plot(grid, mean, color=colour, lw=2.0, zorder=4, label=lbl)
+        else:
+            r = next((x for x in recs if x["detected"]), None)
+            if r is not None:
+                ax.plot(r["times"], r["mbar"], color=colour, lw=2.0,
+                        zorder=4, label=lbl)
+        if g.get("peak") and g["peak"][0] is not None:
+            pk, tp = g["peak"][0], g["t_peak"][0]
+            ax.plot([tp], [pk], "o", ms=7, color=colour, mec="white",
+                    mew=1.5, zorder=6)
+            # Group-mean stats, worked out across the selected shots (mean ± sd
+            # where there is more than one). Placed in the empty upper area so
+            # the tightened axis doesn't crop it; stacked/coloured per group.
+            parts = [f"peak {pk:.3e} mbar  ({100*pk/limit:.0f}% of limit)"]
+            if g.get("dp") and g["dp"][0] is not None:
+                s = f"mean Δp {g['dp'][0]:.3e}"
+                if g["dp"][1] is not None:
+                    s += f" ± {g['dp'][1]:.1e}"
+                parts.append(s)
+            if g.get("t_peak") and g["t_peak"][0] is not None:
+                parts.append(f"t_peak {g['t_peak'][0]*1000:.0f} ms")
+            if g.get("tau") and g["tau"][0] is not None:
+                parts.append(f"τ {g['tau'][0]*1000:.0f} ms")
+            if g.get("s_eff") and g["s_eff"][0] is not None:
+                parts.append(f"S_eff {g['s_eff'][0]:.0f} L/s")
+            if g.get("q_int") and g["q_int"][0] is not None:
+                parts.append(f"Q_pulse {g['q_int'][0]:.2e} mbar·L")
+            ax.annotate("\n".join(parts), xy=(0.30, 0.96 - 0.17 * gi),
+                        xycoords="axes fraction", va="top", ha="left",
+                        fontsize=9, color=colour, zorder=7,
+                        bbox=dict(boxstyle="round,pad=0.4", fc="white",
+                                  ec=colour, lw=0.8, alpha=0.9))
+
+    # Tight y-range: hug the data — just under the noise floor to just over the
+    # tallest peak — instead of padding out to fixed multiples of the baseline.
+    if vis:
+        ylo, yhi = min(vis) / 1.04, max(vis) * 1.06
+    else:
+        ylo, yhi = bl * 0.9, bl * 1.5
+
+    ax.set_yscale("log")
+    ax.set_xlim(*xlim)
+    ax.set_ylim(ylo, yhi)
+
+    # limit line only if it falls inside the (now zoomed) range
+    if ylo <= limit <= yhi:
+        ax.axhline(limit, color=C_FIRE, ls="-", lw=1.2, alpha=0.65, zorder=3)
+        ax.annotate(f"limit  {limit:.0e} mbar", xy=(0.015, limit),
+                    xycoords=("axes fraction", "data"), xytext=(0, -12),
+                    textcoords="offset points", color=C_FIRE, fontsize=9,
+                    va="top")
+    ax.axhline(bl, color=C_BASE, ls="--", lw=1.1, zorder=3)
+    ax.annotate(f"baseline  {bl:.3e} mbar", xy=(0.015, bl),
+                xycoords=("axes fraction", "data"), xytext=(0, 4),
+                textcoords="offset points", color=C_BASE, fontsize=9,
+                va="bottom")
+    ax.axvline(0.0, color=C_FIRE, lw=1.4, zorder=3)
+    ax.annotate("valve fires  (t = 0)", xy=(0, 0.02),
+                xycoords=("data", "axes fraction"), xytext=(7, 0),
+                textcoords="offset points", color=C_FIRE, fontsize=10)
+
+    # ticks: nice values in range; dense enough for a tight span, thinned wide
+    mant = [1.0, 1.2, 1.4, 1.6, 1.8, 2.0, 2.2, 2.4, 2.6, 2.8, 3.0, 3.2,
+            3.4, 3.6, 3.8, 4.0, 4.5, 5.0, 5.5, 6.0, 7.0, 8.0, 9.0]
+    cand = sorted(m * 10 ** e for e in (-8, -7, -6, -5) for m in mant)
+    ticks = [t for t in cand if ylo <= t <= yhi]
+    if len(ticks) > 9:
+        ticks = ticks[::(len(ticks) // 8 + 1)]
+    if ylo <= limit <= yhi and limit not in ticks:
+        ticks.append(limit)
+    ax.set_yticks(sorted(ticks))
+    ax.yaxis.set_major_formatter(FuncFormatter(_mbar_fmt))
+    ax.yaxis.set_minor_formatter(NullFormatter())
+
+    ax.set_xlabel("Time from valve fire (s)")
+    ax.set_ylabel("Chamber pressure (mbar, log scale)")
+    ax.grid(True, which="both", alpha=0.2)
+    for sp in ("top", "right"):
+        ax.spines[sp].set_visible(False)
+    n_all = sum(len(r) for _, r in groups)
+    ax.set_title(f"Gyger pulse — absolute pressure, log scale — "
+                 f"{n_all} shot(s){title_extra}", fontsize=12, loc="left")
     ax.legend(loc="upper right", fontsize=9, framealpha=0.9)
 
 
@@ -789,6 +996,56 @@ def report_groups(groups, stats, args, volume):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# TIME WINDOW
+# ═══════════════════════════════════════════════════════════════════════════
+
+def auto_xlim(records, left=-0.10):
+    """Right-hand limit that follows each trace out to its return to baseline.
+
+    The capture stores several seconds of tail, but a fixed window throws it
+    away and can stop before the pulse has come back — which is exactly what a
+    hard 0.7 s cut does to a shot whose 5 τ runs to ~0.8 s. This walks each
+    DETECTED trace to the last point still clearly above baseline noise, adds a
+    margin (and covers 5 τ where a decay was fit so the whole pump-down shows),
+    and takes the widest limit across all traces. Dead flat tail beyond that is
+    trimmed so the pulse itself is never squashed into the corner.
+
+    With no detected pulse to size against, the whole captured window is shown.
+    """
+    rights = []
+    for r in records:
+        if not r.get("detected", True):
+            continue
+        a, sd = r["a"], r["sd"]
+        post_t, post_e = a.get("post_t") or [], a.get("post_e") or []
+        if len(post_t) < 2:
+            continue
+        # Find the return to baseline on a SMOOTHED trace: over a 5 s tail a
+        # per-sample threshold is tripped by isolated noise spikes and never
+        # trims anything. Average the excess in ~50 ms blocks and test each
+        # block mean against RETURN_K standard errors — a sustained decay stays
+        # above, a lone spike averages away.
+        dt = post_t[1] - post_t[0]
+        w = max(1, int(round(0.05 / dt)))
+        thr = RETURN_K * sd / math.sqrt(w)
+        last_above = 0.0
+        for b in range(len(post_e) // w):
+            seg = post_e[b * w:(b + 1) * w]
+            if sum(seg) / len(seg) > thr:
+                last_above = post_t[b * w + w // 2]
+        cover = 5.0 * a["tau"] if a.get("fit") else 0.0
+        margin = max(TAIL_MARGIN_S, a["tau"]) if a.get("fit") else TAIL_MARGIN_S
+        rights.append(min(post_t[-1], max(last_above, cover) + margin))
+
+    ends = [r["times"][-1] for r in records if r["times"]]
+    if not rights:                          # nothing detected — show it all
+        return (left, max(ends) if ends else 0.70)
+    right = min(max(ends), max(rights))     # never past the recorded data
+    right = max(right, 0.30)                # keep a sensible minimum span
+    return (left, right)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -805,15 +1062,19 @@ def main():
                     default="drift")
     ap.add_argument("--baseline-n", type=int, default=125,
                     help="samples used by --baseline mean (default 125)")
-    ap.add_argument("--xlim", type=float, nargs=2, default=(-0.10, 0.70),
+    ap.add_argument("--xlim", type=float, nargs=2, default=None,
                     metavar=("T0", "T1"),
-                    help="time axis limits in seconds (default -0.1 0.7)")
+                    help="time axis limits in seconds "
+                         "(default: auto, follows the return to baseline)")
     ap.add_argument("--absolute", action="store_true",
                     help="plot raw chamber pressure instead of excess")
     ap.add_argument("--no-individual", action="store_true",
                     help="draw only the group-mean traces")
     ap.add_argument("--logfit", action="store_true",
                     help="add a log-axis panel of the decay")
+    ap.add_argument("--linear", action="store_true",
+                    help="use the linear excess/absolute view instead of the "
+                         "default log-pressure axis")
     ap.add_argument("--out", default=None,
                     help="save to file instead of showing interactively")
     args = ap.parse_args()
@@ -827,8 +1088,23 @@ def main():
     volume = records[0]["volume"]
 
     single = len(records) == 1
+    xlim = tuple(args.xlim) if args.xlim else auto_xlim(records)
 
-    if single:
+    if not args.linear:
+        # DEFAULT: absolute pressure on a log axis, baseline → limit.
+        if single:
+            print()
+            report_single(records[0], args)
+        else:
+            groups = group_by_open_time(records)
+            stats = {k: group_stats(v) for k, v in groups}
+            report_groups(groups, stats, args, volume)
+        groups = group_by_open_time(records)
+        stats = {k: group_stats(v) for k, v in groups}
+        fig, ax = plt.subplots(1, 1, figsize=(13, 6.5))
+        plot_logabs(ax, groups, stats, xlim, args.limit,
+                    title_extra=f" — V = {volume:g} L")
+    elif single:
         r = records[0]
         print()
         report_single(r, args)
@@ -836,7 +1112,7 @@ def main():
                                  1, figsize=(13, 10 if args.logfit else 6.5))
         axes = axes if isinstance(axes, (list, tuple)) or hasattr(axes, "__len__") \
             else [axes]
-        plot_single(axes[0], r, tuple(args.xlim), args.limit,
+        plot_single(axes[0], r, xlim, args.limit,
                     title_extra=f" — V = {volume:g} L")
         if len(axes) > 1:
             groups = group_by_open_time(records)
@@ -851,7 +1127,7 @@ def main():
         fig, axes = plt.subplots(n_panels, 1,
                                  figsize=(13, 10 if args.logfit else 6.5))
         axes = axes if n_panels > 1 else [axes]
-        plot_overlay(axes[0], groups, stats, tuple(args.xlim), args.limit,
+        plot_overlay(axes[0], groups, stats, xlim, args.limit,
                      use_excess=not args.absolute,
                      show_individual=not args.no_individual,
                      title_extra=f" — V = {volume:g} L")

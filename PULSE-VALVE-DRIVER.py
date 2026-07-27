@@ -126,8 +126,11 @@ CAPTURE_PRE_S       = 1.0      # baseline recorded before the pulse (s)
 CAPTURE_POST_S      = 5.0      # transient + tail recorded after the pulse (s)
 CAPTURE_DECIMATE    = 10       # samples averaged per analysis point
 CAPTURE_SETTLE_S    = 3.0      # pause between shots in a multi-shot run (s)
+STREAM_SELFTEST_S   = 0.75     # sustained self-test span per rate rung (s)
 
-CHAMBER_VOLUME_L    = 10.0     # estimated chamber volume, for S_eff and Q_pulse
+CHAMBER_VOLUME_L    = 15.586   # geometric estimate (5 combined cylinders); consistent
+                               # with measured tau ~161 ms if pump line is DN63+.
+                               # Pending final pump-line-diameter check vs Cornelia's 5 L.
 CHAMBER_LIMIT_MBAR  = 1.0e-6   # the in-chamber limit being demonstrated against
 
 FIT_NOISE_K            = 5.0   # stop the decay fit at this x baseline noise
@@ -610,15 +613,27 @@ def _stream_selftest(lj, rate):
                         ScanFrequency=int(rate))
         lj.streamStart()
         try:
-            reads = 0
+            # Stream for a sustained span, not just two packets. A rate the U3
+            # can *start* is not necessarily one it can *hold*: two packets
+            # clear in a few ms, far too short to see a slow FIFO overflow. If
+            # the self-test is that brief it will bless a rate that then stalls
+            # partway through the real 6 s capture — which is exactly the hang.
+            # Watch the whole window and reject on any errored *or* missed
+            # sample, so the chosen rate survives a full capture.
+            deadline = time.time() + STREAM_SELFTEST_S
+            saw_data = False
             for packet in lj.streamData():
+                if time.time() > deadline:
+                    break
                 if packet is None:
                     continue
                 if packet.get('errors'):
                     return False
-                reads += 1
-                if reads >= 2:
-                    return True
+                if packet.get('missed'):
+                    return False
+                if packet.get(f'AIN{LABJACK_FIO2_CHANNEL}'):
+                    saw_data = True
+            return saw_data
         finally:
             try:
                 lj.streamStop()
@@ -673,10 +688,22 @@ def _capture_stream_fire(lj, rate):
                     NChannels=[31],
                     Resolution=CAPTURE_RESOLUTION,
                     ScanFrequency=int(rate))
+    window_s = CAPTURE_PRE_S + CAPTURE_POST_S
+    deadline = time.time() + window_s + 3.0   # hard ceiling on the whole stream
+    stalled  = False
     fire_thread = None
     try:
         lj.streamStart()
         for packet in lj.streamData():
+            # A rate the U3 can start is not always one it can sustain. If the
+            # stream stalls mid-capture, streamData() keeps yielding empty /
+            # recovery packets and len(volts) never reaches total_n, so this
+            # loop spins forever and the whole capture hangs. Bail on a
+            # wall-clock deadline (or on shutdown) so _capture_busy is always
+            # cleared and the app can recover instead of freezing.
+            if _stop.is_set() or time.time() > deadline:
+                stalled = len(volts) < total_n
+                break
             if packet is None:
                 continue
             if packet.get('errors'):
@@ -701,6 +728,10 @@ def _capture_stream_fire(lj, rate):
             pass
         if fire_thread is not None:
             fire_thread.join(timeout=1.0)
+
+    if stalled:
+        log_event(f"CAPTURE: stream stalled at {len(volts)}/{total_n} "
+                  f"samples @ {rate:g} Hz — aborted (would have hung)")
 
     return (volts[:total_n], fire_idx,
             fired.get('ok', False), fired.get('ot'), missed)
