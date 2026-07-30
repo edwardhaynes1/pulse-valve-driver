@@ -37,6 +37,7 @@ isolation valve → **pulse valve** → conductance limiter → vacuum chamber (
 | Device | Interface | Role |
 |---|---|---|
 | Keller PAA-23SX-H2 | RS-485 / USB (K-114 adapter) | Upstream pressure + temperature |
+| Gyger SMLD 300G | Driven by ZC1 controller | Pulse valve |
 | ZC1 controller | RS-232 / USB | Pulse valve driver |
 | LabJack U3 | USB | Vacuum chamber gauge on FIO2 |
 
@@ -69,8 +70,7 @@ python PULSE-VALVE-DRIVER.py
 | `v` | Fire one pulse, no capture |
 | `c [n]` | Capture n pulses at high rate (default 1, max 50) |
 | `t <µs>` | Set open time (50 – 5 000 000 µs) |
-| `cap <id_µm> <len_mm> [label]` | Record the installed limiter (bore in µm, length in mm) |
-| `cap none` | Record that no limiter is fitted (`off` / `0` also accepted) |
+| `cap <id_µm> <len_mm>` | Record the installed capillary (bore in µm, length in mm) |
 | `gas <species>` | Record the gas at the valve (e.g. `N2`, `H2`, `He`, `Ar`) |
 | `q` | Quit |
 
@@ -78,18 +78,17 @@ The open time in force is shown in the driver window, recorded in every session 
 
 ### Run identity
 
-The limiter geometry and the gas cannot be detected by any instrument — they change only when hardware is physically swapped. They are held as live settings, seeded at startup from the configuration block and changeable at any time with `cap` and `gas`. Whatever is in force is stamped into every subsequent capture header and session row.
+The capillary geometry and the gas cannot be detected by any instrument — they change only when hardware is physically swapped. They are held as live settings, seeded at startup from the configuration block and changeable at any time with `cap` and `gas`. Whatever is in force is stamped into every subsequent capture header and session row.
 
 ```
-cap 50 100            # 50 µm bore, 100 mm (= 10 cm) long. NOTE: length is in mm.
-cap 41.5 100 batch B  # non-integer bore is fine (record as-measured, not nominal)
-cap none              # running with no limiter
-gas N2                # gas at the valve
+cap 50 100     # 50 µm bore, 100 mm (= 10 cm) long. NOTE: length is in mm.
+cap 41.5 100   # non-integer bore is fine (record as-measured, not nominal)
+gas N2         # gas at the valve
 ```
 
-Everything after the two numbers becomes a free-text label and keeps its original capitalisation. The numbers are parsed as floats and must both be present; `cap 50` alone is rejected.
+The rig always has a capillary after the valve, so both numbers are required and must be positive; `cap 50` alone, or a zero/negative value, is rejected. The numbers are parsed as floats.
 
-**Staleness is the failure mode to guard against.** Nothing checks the values against reality — `cap 500 100` while a 50 µm is installed will confidently mislabel every shot. The driver defends against this by printing a **RUN IDENTITY** banner at startup and keeping the limiter and gas in the status hint at all times. Glance at the banner before capturing; if it is wrong, correct it with `cap` / `gas` first.
+**Staleness is the failure mode to guard against.** Nothing checks the values against reality — `cap 500 100` while a 50 µm is installed will confidently mislabel every shot. The driver defends against this by printing a **RUN IDENTITY** banner at startup and keeping the capillary and gas in the status hint at all times. Glance at the banner before capturing; if it is wrong, correct it with `cap` / `gas` first.
 
 **Upstream pressure is handled the other way** — it is read live from the Keller and snapshotted at the fire instant, so it is always correct and needs no setting.
 
@@ -104,6 +103,8 @@ Everything after the two numbers becomes a free-text label and keeps its origina
 ```
 
 Nothing needs to be timed by hand. Normal monitoring pauses for the window and resumes automatically. `c 20` runs twenty shots with a settling pause between each and prints mean ± spread at the end.
+
+The shots of one `c n` run are tied together so the files are identifiable as a single capture. They share a `capture_group_id` (written into each header) and a filename prefix, and each records its position in the run: `pulse_<groupid>_s01.csv`, `pulse_<groupid>_s02.csv`, and so on, sorting naturally by shot. A single shot is written as `pulse_<groupid>.csv` with a group size of 1.
 
 The stream rate is probed at the first capture: a ladder of rates is tried fastest-first and the first one the U3 sustains cleanly is cached for the session. The probe runs before the valve is armed, so a rejected rate never wastes a shot.
 
@@ -132,12 +133,11 @@ Sensor readings at the configured cadence, with pulse events embedded in the row
 | `pulse_timestamps_us` | Semicolon-separated microsecond timestamps of any pulses in this interval (blank if none) |
 | `pulse_open_times_us` | Semicolon-separated open times for those pulses |
 | `pulse_acks` | Semicolon-separated ACK flags (1 = ZC1 acknowledged, 0 = no response) |
-| `capillary_id_um` | Limiter bore (µm) in force for this row; blank if no limiter fitted |
-| `capillary_length_mm` | Limiter length (mm) in force for this row; blank if no limiter fitted |
-| `capillary_label` | Free-text batch/serial note (blank if no limiter) |
+| `capillary_id_um` | Capillary bore (µm) in force for this row |
+| `capillary_length_mm` | Capillary length (mm) in force for this row |
 | `gas_species` | Gas at the valve (recorded only; gauge still reads N₂-equivalent) |
 
-Rows with no pulse in their interval leave the three `pulse_*` columns blank, so filtering to pulse rows is simply a matter of selecting rows where `pulse_timestamps_us` is non-empty. The four identity columns are stamped on every row, so a mid-session `cap` / `gas` change is visible as the exact row where the values switch.
+Rows with no pulse in their interval leave the three `pulse_*` columns blank, so filtering to pulse rows is simply a matter of selecting rows where `pulse_timestamps_us` is non-empty. The three identity columns are stamped on every row, so a mid-session `cap` / `gas` change is visible as the exact row where the values switch.
 
 ### `pulse_<timestamp>.csv` — one per capture
 
@@ -148,7 +148,9 @@ A commented header of derived values, then the decimated trace with `t = 0` at t
 | `capture_rate_hz` | Stream rate actually used |
 | `analysis_rate_hz` | Rate after decimation |
 | `open_time_us`, `zc1_ack` | Valve setting, and whether the ZC1 acknowledged the shot |
-| `capillary_id_um`, `capillary_length_mm`, `capillary_label` | Limiter geometry that produced the shot; blank if none fitted |
+| `capture_group_id` | Shared id for all shots of one `c n` run; ties the files together |
+| `capture_shot_index`, `capture_group_size` | This shot's position in the run, and the run's size |
+| `capillary_id_um`, `capillary_length_mm` | Capillary geometry that produced the shot |
 | `gas_species` | Gas at the valve (recorded only; not applied to the gauge conversion) |
 | `upstream_bar_at_fire` | Upstream pressure snapshotted at the fire instant |
 | `upstream_degC_at_fire` | Upstream temperature snapshotted at the fire instant |
@@ -169,7 +171,7 @@ The identity and upstream fields are written for **every** outcome — including
 
 ## What the capture numbers mean
 
-**τ (tau)** — the decay time constant read from the shape of the tail alone. Every τ seconds, whatever excess pressure remains falls to 36.8 % of its previous value; practically, the chamber is back to baseline after about 5τ. **What τ represents depends on what is slowest.** With no limiter (or a wide one), the tail is the chamber emptying through the pump, and τ = V/S_eff. With a restrictive limiter, the tail is the *limiter* bleeding its charge into the chamber, which can be seconds — far slower than the pump — so τ is then a limiter property, not a chamber-pumping one. The response is genuinely two-timescale in that case: a fast chamber-pumping component (τ_fast) sitting under a slow limiter-emptying tail (τ_slow). `PULSE-PLOTTER.py` fits both; the driver's onboard fit reports a single τ and, on a restrictive limiter, that single τ is the slow tail.
+**τ (tau)** — the decay time constant read from the shape of the tail alone. Every τ seconds, whatever excess pressure remains falls to 36.8 % of its previous value; practically, the chamber is back to baseline after about 5τ. **What τ represents depends on what is slowest.** With a wide, non-restrictive capillary, the tail is the chamber emptying through the pump, and τ = V/S_eff. With a restrictive one, the tail is the *capillary* bleeding its charge into the chamber, which can be seconds — far slower than the pump — so τ is then a capillary property, not a chamber-pumping one. The response is genuinely two-timescale in that case: a fast chamber-pumping component (τ_fast) sitting under a slow limiter-emptying tail (τ_slow). `PULSE-PLOTTER.py` fits both; the driver's onboard fit reports a single τ and, on a restrictive limiter, that single τ is the slow tail.
 
 **S_eff = V / τ** — the pumping speed the chamber actually experiences (the pump's nameplate degraded by everything between chamber and pump). Constant in molecular flow (below ~10⁻³ mbar), but species-dependent: an S_eff measured in N₂ does not transfer to H₂. **S_eff is only V/τ when τ is the chamber-pumping time.** On a restrictive-limiter shot the onboard `s_eff_l_s` is computed from the slow tail and will read several times too low. For those shots, trust τ_fast from `PULSE-PLOTTER.py`, or — better — measure S_eff once without a limiter and carry it as a fixed constant rather than re-deriving it from every pulse.
 
@@ -235,13 +237,12 @@ CHAMBER_VOLUME_L    = 15.586    # chamber volume, for S_eff and Q_pulse
 CHAMBER_LIMIT_MBAR  = 1.0e-6    # limit being demonstrated against
 
 # ── Run identity (seeds the live cap / gas settings at startup) ──
-DEFAULT_CAPILLARY_ID_UM  = 50.0    # limiter bore (µm); 0 or None = no limiter
-DEFAULT_CAPILLARY_LEN_MM = 100.0   # limiter length (mm)
-DEFAULT_CAPILLARY_LABEL  = ""      # free-text batch/serial note
+DEFAULT_CAPILLARY_ID_UM  = 50.0    # capillary bore (µm)
+DEFAULT_CAPILLARY_LEN_MM = 100.0   # capillary length (mm)
 DEFAULT_GAS_SPECIES      = "N2"    # gas at the valve (recorded only)
 ```
 
-`CHAMBER_VOLUME_L` should be set from CAD before quoting S_eff or Q_pulse. The run-identity defaults are only a starting point — change the installed limiter and gas at runtime with `cap` / `gas` rather than editing and relaunching.
+`CHAMBER_VOLUME_L` should be set from CAD before quoting S_eff or Q_pulse. The run-identity defaults are only a starting point — change the installed capillary and gas at runtime with `cap` / `gas` rather than editing and relaunching.
 
 `CAPTURE_POST_S` should be at least 5τ so the tail is fully captured. The default of 5 s suits an unlimited chamber (τ ~ 0.1–0.2 s), but a restrictive limiter can push τ to several seconds, needing 20–30 s; if the trace has not returned to baseline by the end of the window, the integral (and hence Q_pulse) is truncated low. Raise `CAPTURE_POST_S` for limiter work.
 

@@ -119,26 +119,21 @@ def session_identity_str(rows):
     def state(r):
         idd = (r.get("capillary_id_um") or "").strip()
         ln  = (r.get("capillary_length_mm") or "").strip()
-        lab = (r.get("capillary_label") or "").strip()
         gas = (r.get("gas_species") or "").strip()
-        if idd:
-            cap = f"{idd} µm × {ln} mm" if ln else f"{idd} µm"
-            if lab:
-                cap += f" ({lab})"
-        else:
-            cap = "no limiter"
+        if not idd:
+            return None                    # blank/old row — skip
+        cap = f"{idd} µm × {ln} mm" if ln else f"{idd} µm"
         return cap, (gas if gas else "gas n/a")
 
     # distinct (cap, gas) states in order of first appearance
     seen, order = set(), []
     for r in rows:
-        cap, gas = state(r)
-        if cap == "no limiter" and gas == "gas n/a":
-            continue                       # wholly blank row — ignore
-        key = (cap, gas)
-        if key not in seen:
-            seen.add(key)
-            order.append(key)
+        st = state(r)
+        if st is None:
+            continue
+        if st not in seen:
+            seen.add(st)
+            order.append(st)
 
     if not order:
         return ""

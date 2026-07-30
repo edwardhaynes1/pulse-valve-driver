@@ -145,9 +145,8 @@ CHAMBER_LIMIT_MBAR  = 1.0e-6   # the in-chamber limit being demonstrated against
 #
 # Upstream pressure is deliberately NOT here: it is read live from the Keller and
 # stamped at the fire instant, so it can never go stale.
-DEFAULT_CAPILLARY_ID_UM  = 50.0    # limiter bore, micrometres (0 or None = no limiter fitted)
+DEFAULT_CAPILLARY_ID_UM  = 50.0    # limiter bore, micrometres
 DEFAULT_CAPILLARY_LEN_MM = 100.0   # limiter length, millimetres
-DEFAULT_CAPILLARY_LABEL  = ""      # free-text batch/serial note, e.g. "batch B, cleaved end"
 DEFAULT_GAS_SPECIES      = "N2"    # gas at the valve. RECORDED ONLY — the gauge conversion
                                    # still assumes N2/air; apply the species factor
                                    # (H2~2.4, He~5.9, Ar~0.8) downstream, not here.
@@ -207,7 +206,6 @@ _state       = dict(
     # Run identity — what produced the captures. Runtime-settable (cap / gas).
     capillary_id_um             = DEFAULT_CAPILLARY_ID_UM,
     capillary_len_mm            = DEFAULT_CAPILLARY_LEN_MM,
-    capillary_label             = DEFAULT_CAPILLARY_LABEL,
     gas_species                 = DEFAULT_GAS_SPECIES,
     # Pulse event log: list of (iso_timestamp, open_us, ack_ok) since last row
     pulse_events                = [],
@@ -227,6 +225,9 @@ _capture_pending = 0                   # shots still queued in a multi-shot run
 _capture_runs    = []                  # per-shot summary dicts, this session
 _stream_rate     = None                # probed once, then cached for the session
 _summary_window  = 0                   # shots in the current multi-shot run
+_capture_group_id    = None            # shared id for the shots of one `c n` run
+_capture_group_size  = 0               # shots requested in the current `c n` run
+_capture_group_index = 0               # shots started so far in the current run
 
 
 def log_event(text: str):
@@ -387,15 +388,17 @@ def labjack_thread():
                 # Streaming takes exclusive control of the U3, so it has to run
                 # on this thread. Monitoring pauses for the window and resumes
                 # automatically. A multi-shot run re-arms itself here.
-                global _capture_busy, _capture_pending
+                global _capture_busy, _capture_pending, _capture_group_index
                 if _capture_request.is_set():
                     _capture_request.clear()
                     _capture_busy = True
+                    _capture_group_index += 1
                     try:
                         _run_capture(
                             lj,
-                            shot_index=None if _capture_pending <= 0 else
-                            len(_capture_runs) + 1)
+                            shot_index=_capture_group_index,
+                            group_id=_capture_group_id,
+                            group_size=_capture_group_size)
                     except Exception as e:
                         log_event(f"CAPTURE failed ({e}) — reconnecting device")
                         _capture_busy = False
@@ -850,43 +853,48 @@ def _fit_decay(times, mbar, p_base, floor):
 
 
 def _capillary_str():
-    """Human-readable limiter geometry, e.g. '50 µm × 100 mm (batch B)' or 'none'."""
+    """Human-readable capillary geometry, e.g. '50 µm × 100 mm'."""
     with _lock:
         idd = _state['capillary_id_um']
         ln  = _state['capillary_len_mm']
-        lab = _state['capillary_label']
-    if not idd:
-        return "none"
-    s = f"{idd:g} µm × {ln:g} mm"
-    if lab:
-        s += f" ({lab})"
-    return s
+    return f"{idd:g} µm × {ln:g} mm"
 
 
 def _run_conditions(up_bar, up_degC):
-    """Fields describing what produced a capture: limiter geometry, gas, and the
-    upstream state at the fire instant. Merged into every capture header (all
-    outcomes) so a file is self-describing and comparable standalone. Blank
-    fields render as 'n/a' in the plotters rather than being silently dropped."""
+    """Fields describing what produced a capture: capillary geometry, gas, and
+    the upstream state at the fire instant. Merged into every capture header
+    (all outcomes) so a file is self-describing and comparable standalone."""
     with _lock:
         idd = _state['capillary_id_um']
         ln  = _state['capillary_len_mm']
-        lab = _state['capillary_label']
         gas = _state['gas_species']
     return {
-        'capillary_id_um':       f"{idd:g}" if idd else '',
-        'capillary_length_mm':   f"{ln:g}"  if idd else '',
-        'capillary_label':       lab if idd else '',
+        'capillary_id_um':       f"{idd:g}",
+        'capillary_length_mm':   f"{ln:g}",
         'gas_species':           gas,
         'upstream_bar_at_fire':  f"{up_bar:.4f}"  if up_bar  is not None else '',
         'upstream_degC_at_fire': f"{up_degC:.2f}" if up_degC is not None else '',
     }
 
 
-def _write_capture_csv(times, mbar, meta):
-    """Write one capture to its own CSV; return the path."""
-    stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    path = os.path.join(LOG_DIR, f"pulse_{stamp}.csv")
+def _capture_group_meta(group_id, shot_index, group_size):
+    """Fields that tie the shots of one multi-shot `c n` run together, so files
+    from the same capture are identifiable. For a single shot the group is of
+    size 1. `capture_group_id` is shared by every shot in the run; the files
+    also share it as a filename prefix."""
+    return {
+        'capture_group_id':   group_id,
+        'capture_shot_index': shot_index,
+        'capture_group_size': group_size,
+    }
+
+
+def _write_capture_csv(times, mbar, meta, stem=None):
+    """Write one capture to its own CSV; return the path. `stem` sets the
+    filename (without extension); defaults to a fresh timestamp."""
+    if stem is None:
+        stem = f"pulse_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    path = os.path.join(LOG_DIR, f"{stem}.csv")
     with open(path, 'w', newline='') as f:
         w = csv.writer(f)
         for k, v in meta.items():
@@ -897,9 +905,17 @@ def _write_capture_csv(times, mbar, meta):
     return path
 
 
-def _run_capture(lj, shot_index=None):
-    """Capture one pulse, analyse it, save it, and report to the event log."""
-    tag = "" if shot_index is None else f" [{shot_index}]"
+def _run_capture(lj, shot_index=1, group_id=None, group_size=1):
+    """Capture one pulse, analyse it, save it, and report to the event log.
+
+    shot_index / group_id / group_size tie the shots of one `c n` run together;
+    they are stamped into the header and shared as a filename prefix."""
+    if group_id is None:
+        group_id = datetime.now().strftime('%Y%m%d_%H%M%S')
+    tag  = "" if group_size <= 1 else f" [{shot_index}/{group_size}]"
+    stem = (f"pulse_{group_id}_s{shot_index:02d}"
+            if group_size > 1 else f"pulse_{group_id}")
+    grp  = _capture_group_meta(group_id, shot_index, group_size)
 
     rate = _choose_stream_rate(lj)
     if rate is None:
@@ -1011,7 +1027,9 @@ def _run_capture(lj, shot_index=None):
                                          'capture_rate_hz': rate,
                                          'open_time_us': open_us,
                                          'zc1_ack': int(bool(fire_ok)),
-                                         **_run_conditions(up_bar, up_degC)})
+                                         **grp,
+                                         **_run_conditions(up_bar, up_degC)},
+                           stem=stem)
         return None
 
     if not detected:
@@ -1037,6 +1055,7 @@ def _run_capture(lj, shot_index=None):
             'analysis_rate_hz': 1.0 / dt,
             'open_time_us': open_us,
             'zc1_ack': int(bool(fire_ok)),
+            **grp,
             **_run_conditions(up_bar, up_degC),
             'p_base_mbar': f"{p_base:.6e}",
             'baseline_sd_mbar': f"{sd_pre:.6e}",
@@ -1045,7 +1064,7 @@ def _run_capture(lj, shot_index=None):
             'dp_upper_bound_mbar': f"{ub:.6e}",
             'samples_missed': missed,
         }
-        path = _write_capture_csv(times, mbar, meta)
+        path = _write_capture_csv(times, mbar, meta, stem=stem)
         log_event(f"CAPTURE{tag}: {os.path.basename(path)}")
         _capture_runs.append(dict(meta, path=path, peak=None, tau=None,
                                   detected=False))
@@ -1090,6 +1109,7 @@ def _run_capture(lj, shot_index=None):
         'analysis_rate_hz': 1.0 / dt,
         'open_time_us': open_us,
         'zc1_ack': int(bool(fire_ok)),
+        **grp,
         **_run_conditions(up_bar, up_degC),
         'p_base_mbar': f"{p_base:.6e}",
         'baseline_sd_mbar': f"{sd_pre:.6e}",
@@ -1108,7 +1128,7 @@ def _run_capture(lj, shot_index=None):
         'q_pulse_mbar_l_v_dp': f"{q_peak:.6e}",
         'samples_missed': missed,
     }
-    path = _write_capture_csv(times, mbar, meta)
+    path = _write_capture_csv(times, mbar, meta, stem=stem)
     log_event(f"CAPTURE{tag}: {os.path.basename(path)}")
 
     run = dict(meta)
@@ -1264,7 +1284,6 @@ def logger_thread():
             'pulse_acks',              # semicolon-separated 1/0 ack flags
             'capillary_id_um',         # limiter bore in force for this row
             'capillary_length_mm',     # limiter length in force for this row
-            'capillary_label',         # free-text batch/serial note
             'gas_species',             # gas in force for this row
         ])
         f.flush()
@@ -1287,7 +1306,6 @@ def logger_thread():
                 ot     = _state['open_time_us']
                 cap_id = _state['capillary_id_um']
                 cap_ln = _state['capillary_len_mm']
-                cap_lb = _state['capillary_label']
                 gas    = _state['gas_species']
                 _state['pulse_interval'] = 0
 
@@ -1306,9 +1324,7 @@ def logger_thread():
             writer.writerow([
                 ts, p_mean, t_mean, n_k, vac, p_int, p_tot, ot,
                 pulse_ts, pulse_ots, pulse_acks,
-                (f"{cap_id:g}" if cap_id else ''),
-                (f"{cap_ln:g}" if cap_id else ''),
-                (cap_lb if cap_id else ''), gas,
+                f"{cap_id:g}", f"{cap_ln:g}", gas,
             ])
             f.flush()
 
@@ -1454,7 +1470,7 @@ class PVDGui:
         self._driver_print("  v              fire one pulse (no capture)")
         self._driver_print("  c [n]          capture n pulses at high rate")
         self._driver_print("  t <µs>         set open time")
-        self._driver_print("  cap <id> <len> [label] | cap none   set limiter (µm, mm)")
+        self._driver_print("  cap <id> <len>  set capillary (bore µm, length mm)")
         self._driver_print("  gas <species>  set gas (N2, H2, He, Ar…)")
         self._driver_print("  q              quit")
         self._driver_print("")
@@ -1469,10 +1485,10 @@ class PVDGui:
         with _lock:
             gas = _state['gas_species']
         self._driver_print("  ┄┄┄ RUN IDENTITY — check before capturing ┄┄┄", "ok")
-        self._driver_print(f"    limiter:  {_capillary_str()}", "ok")
-        self._driver_print(f"    gas:      {gas}", "ok")
-        self._driver_print("    upstream: read live from the Keller, stamped at fire", "dim")
-        self._driver_print("    wrong?  cap <id_µm> <len_mm> [label]   /   gas <species>", "dim")
+        self._driver_print(f"    capillary: {_capillary_str()}", "ok")
+        self._driver_print(f"    gas:       {gas}", "ok")
+        self._driver_print("    upstream:  read live from the Keller, stamped at fire", "dim")
+        self._driver_print("    wrong?  cap <id_µm> <len_mm>   /   gas <species>", "dim")
         self._driver_print("  ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄", "ok")
 
     def _driver_print(self, line, tag=None):
@@ -1490,7 +1506,7 @@ class PVDGui:
             idd = _state['capillary_id_um']
             ln  = _state['capillary_len_mm']
             gas = _state['gas_species']
-        cap = f"{idd:g}µm×{ln:g}mm" if idd else "no limiter"
+        cap = f"{idd:g}µm×{ln:g}mm"
         ident = f"{cap} · {gas}"
         if _capture_busy:
             self.hint_var.set(f"{ident}  |  open={ot} µs  |  CAPTURING…")
@@ -1520,7 +1536,8 @@ class PVDGui:
             log_event(f"pulse fired  {ot} µs  {status}")
 
         elif cmd == "c":
-            global _capture_pending, _summary_window
+            global _capture_pending, _summary_window, _capture_group_id, \
+                   _capture_group_size, _capture_group_index
             if _capture_busy or _capture_request.is_set():
                 self._driver_print("  capture already running", "err")
                 return
@@ -1536,6 +1553,9 @@ class PVDGui:
                     return
             _capture_pending = n
             _summary_window  = n
+            _capture_group_id    = datetime.now().strftime('%Y%m%d_%H%M%S')
+            _capture_group_size  = n
+            _capture_group_index = 0
             _capture_request.set()
             window = CAPTURE_PRE_S + CAPTURE_POST_S
             total  = n * window + (n - 1) * CAPTURE_SETTLE_S
@@ -1555,15 +1575,11 @@ class PVDGui:
                 self._driver_print("  usage: t <µs>  (50 – 5 000 000)")
 
         elif cmd == "cap":
-            # cap none                 -> no limiter fitted
-            # cap <id_µm> <len_mm> [label...]
-            if len(parts) == 2 and parts[1] in ("none", "off", "0"):
-                self._set_capillary(0, 0, "")
-            elif len(parts) >= 3:
-                label = " ".join(raw_parts[3:]) if len(raw_parts) > 3 else ""
-                self._set_capillary(parts[1], parts[2], label)
+            # cap <id_µm> <len_mm>
+            if len(parts) == 3:
+                self._set_capillary(parts[1], parts[2])
             else:
-                self._driver_print("  usage: cap <id_µm> <len_mm> [label]   or   cap none", "err")
+                self._driver_print("  usage: cap <id_µm> <len_mm>", "err")
 
         elif cmd == "gas":
             if len(raw_parts) == 2:
@@ -1606,25 +1622,25 @@ class PVDGui:
         log_event(f"open time  →  {new_val} µs{suffix}")
         self._update_hint()
 
-    def _set_capillary(self, id_um, len_mm, label):
-        """Record the limiter now installed. Stamped into every subsequent
-        capture and session row. Set id to 0 (cap none) when running unlimited."""
+    def _set_capillary(self, id_um, len_mm):
+        """Record the capillary now installed. Stamped into every subsequent
+        capture and session row. The rig always has a capillary after the
+        valve, so both values must be positive."""
         try:
             idd = float(id_um)
             ln  = float(len_mm)
         except (ValueError, TypeError):
             self._driver_print("  invalid — id and length must be numbers", "err")
             return
-        if idd < 0 or ln < 0:
-            self._driver_print("  invalid — id and length must be ≥ 0", "err")
+        if idd <= 0 or ln <= 0:
+            self._driver_print("  invalid — id and length must be > 0", "err")
             return
         with _lock:
             _state['capillary_id_um']  = idd
             _state['capillary_len_mm'] = ln
-            _state['capillary_label']  = label
         desc = _capillary_str()
-        self._driver_print(f"  limiter → {desc}", "ok")
-        log_event(f"limiter  →  {desc}")
+        self._driver_print(f"  capillary → {desc}", "ok")
+        log_event(f"capillary  →  {desc}")
         self._update_hint()
 
     def _set_gas(self, species):

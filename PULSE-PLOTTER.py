@@ -610,19 +610,13 @@ def _mbar_fmt(v, _pos=None):
 
 
 def _cap_gas_str(meta):
-    """Limiter geometry + gas from a capture header. Distinguishes three cases:
-    a recorded limiter, an explicit 'no limiter', and a capture predating the
-    identity stamp (shown as 'n/a' rather than silently implying no limiter)."""
+    """Capillary geometry + gas from a capture header. Shows 'n/a' for captures
+    that predate the identity stamp (fields absent), never implying a bore."""
     idd = str(meta.get("capillary_id_um", "")).strip()
     ln  = str(meta.get("capillary_length_mm", "")).strip()
-    lab = str(meta.get("capillary_label", "")).strip()
     gas = str(meta.get("gas_species", "")).strip()
     if idd:
         cap = f"{idd} µm × {ln} mm" if ln else f"{idd} µm"
-        if lab:
-            cap += f" ({lab})"
-    elif "capillary_id_um" in meta:
-        cap = "no limiter"
     else:
         cap = "capillary n/a"
     return f"{cap}  ·  {gas if gas else 'gas n/a'}"
