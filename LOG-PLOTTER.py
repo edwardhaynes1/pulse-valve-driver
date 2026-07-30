@@ -20,6 +20,9 @@ Usage
   --out FILE      Save the figure to FILE (default: show interactively)
   --zoom          Crop the time axis to a margin around the pulses
   --margin S      Seconds of margin either side of pulses when --zoom is used
+  --smooth N      Moving-average window (rows) for the upstream traces at plot
+                  time; 0 = raw (default). The log is stored raw, so any
+                  averaging is a plotting choice.
 
 If no CSV file is given on the command line, a file-picker dialog opens so you
 can choose which log to plot. If the dialog can't open (e.g. no display), a
@@ -53,6 +56,22 @@ def to_float(s):
         return float(s)
     except (ValueError, TypeError):
         return None
+
+
+def smooth(vals, n):
+    """Trailing moving average over a window of n rows, skipping None. Used at
+    plot time only — the logged data is raw. A point with no usable samples in
+    its window stays None, so gaps are preserved."""
+    if not n or n <= 1:
+        return list(vals)
+    out, run = [], []
+    for v in vals:
+        run.append(v)
+        if len(run) > n:
+            run.pop(0)
+        good = [x for x in run if x is not None]
+        out.append(sum(good) / len(good) if good else None)
+    return out
 
 
 
@@ -161,6 +180,10 @@ def main():
     ap.add_argument("--margin", type=float, default=30.0,
                     help="seconds of margin either side of pulses when --zoom "
                          "is used (default 30)")
+    ap.add_argument("--smooth", type=int, default=0, metavar="N",
+                    help="moving-average window (in rows) applied at plot time "
+                         "to the raw upstream traces; 0 = raw (default). The log "
+                         "is stored raw, so smoothing is a plotting choice.")
     args = ap.parse_args()
 
     csv_path = args.csv if args.csv else choose_csv_file()
@@ -181,6 +204,11 @@ def main():
     t         = [parse_ts(r["timestamp"]) for r in rows]
     up_p      = [to_float(r["keller_pressure_bar"]) for r in rows]
     up_t      = [to_float(r["keller_temperature_degC"]) for r in rows]
+    if args.smooth and args.smooth > 1:
+        up_p = smooth(up_p, args.smooth)
+        up_t = smooth(up_t, args.smooth)
+        print(f"Upstream traces smoothed with a {args.smooth}-row moving average "
+              f"(plot-time only; log is raw)")
     vac       = [to_float(r["vacuum_chamber_mbar"]) for r in rows]
 
     # ── Extract pulse events (may be multiple per row, semicolon-sep) ──────

@@ -93,6 +93,10 @@ KELLER_PORT        = None       # None = auto-detect
 KELLER_TIMEOUT     = 0.3
 KELLER_ECHO        = True       # K-114 adapter echoes TX
 KELLER_POLL_HZ     = 4          # Keller read rate
+FIRE_SNAPSHOT_N    = 5          # recent Keller samples median-ed for the at-fire
+                                # upstream snapshot. A median rejects the ±1 LSB
+                                # quantisation toggle and one-off spikes without
+                                # the lag a mean would add over the slow drift.
 ZC1_BAUD           = 38400
 ZC1_PORT           = None       # None = auto-detect
 LOG_INTERVAL_S     = 0.5        # seconds between logged rows (drift-free)
@@ -103,6 +107,10 @@ DRIVE_HZ_MIN       = 0.01       # clamp: slowest auto-drive rate
 DRIVE_HZ_MAX       = 200.0      # clamp: fastest auto-drive rate
 
 CHART_SECONDS      = 120        # pressure strip-chart window (s)
+DISPLAY_SMOOTH_S   = 1.0        # strip-chart display smoothing, in SECONDS (display
+                                # only; the log stays raw). Applied to all three
+                                # charts, so each smooths over the same real time
+                                # regardless of its sample rate. 0 = no smoothing.
 LOG_DIR            = str(Path(__file__).parent / "logs")
 
 # ─── Pulse capture ────────────────────────────────────────────────────────────
@@ -196,8 +204,6 @@ _drive_on    = threading.Event()       # set => automatic valve drive is running
 _state       = dict(
     keller_pressure_samples     = [],    # accumulated between log rows, then averaged
     keller_temperature_samples  = [],    # accumulated between log rows, then averaged
-    keller_pressure_last        = None,  # most recent single reading (stamped at fire)
-    keller_temperature_last     = None,  # most recent single reading (stamped at fire)
     vacuum_chamber_mbar         = None,  # latest single reading
     pulse_interval              = 0,     # pulses fired since last log row (reset each row)
     pulses_total                = 0,
@@ -213,6 +219,9 @@ _state       = dict(
 _events      = deque(maxlen=200)                          # (timestamp, text)
 _chart       = deque(maxlen=CHART_SECONDS * KELLER_POLL_HZ)     # recent upstream pressures
 _temp_chart  = deque(maxlen=CHART_SECONDS * KELLER_POLL_HZ)     # recent upstream temperatures
+_keller_p_recent = deque(maxlen=FIRE_SNAPSHOT_N)   # last few upstream pressures — for the fire snapshot
+_keller_t_recent = deque(maxlen=FIRE_SNAPSHOT_N)   # last few upstream temperatures — for the fire snapshot
+_keller_log_pending = []   # (ts, p, t) per Keller poll — drained by the logger so every raw sample is written (zero loss)
 _vac_chart   = deque(maxlen=CHART_SECONDS * LABJACK_SAMPLE_HZ)  # recent vacuum readings
 _zc1_serial  = None
 _zc1_ok      = False
@@ -316,15 +325,24 @@ def keller_thread(initial_port: str, initial_bus):
                 t0 = time.time()
                 p1   = bus.f73(KELLER_ADDRESS, 1)
                 tob1 = bus.f73(KELLER_ADDRESS, 4)
+                ts_s = datetime.now().isoformat(timespec='milliseconds')
                 with _lock:
                     if p1 is not None:
                         _state['keller_pressure_samples'].append(round(p1, 4))
-                        _state['keller_pressure_last'] = round(p1, 4)
+                        _keller_p_recent.append(p1)
                         _chart.append(p1)
                     if tob1 is not None:
                         _state['keller_temperature_samples'].append(round(tob1, 2))
-                        _state['keller_temperature_last'] = round(tob1, 2)
+                        _keller_t_recent.append(tob1)
                         _temp_chart.append(tob1)
+                    if p1 is not None or tob1 is not None:
+                        # One entry per poll, timestamped at read time, so the
+                        # logger can write every raw sample regardless of its
+                        # flush cadence — zero loss, no thread-drift dependence.
+                        _keller_log_pending.append((
+                            ts_s,
+                            round(p1, 4) if p1 is not None else None,
+                            round(tob1, 2) if tob1 is not None else None))
                 _stop.wait(timeout=max(0.0, interval - (time.time() - t0)))
 
         except Exception as e:
@@ -335,8 +353,8 @@ def keller_thread(initial_port: str, initial_bus):
         with _lock:
             _state['keller_pressure_samples']    = []
             _state['keller_temperature_samples'] = []
-            _state['keller_pressure_last']       = None
-            _state['keller_temperature_last']    = None
+            _keller_p_recent.clear()
+            _keller_t_recent.clear()
 
         if _stop.is_set():
             break
@@ -702,6 +720,34 @@ def _choose_stream_rate(lj):
     return None
 
 
+def _smooth_display(vals, n):
+    """Trailing moving average for DISPLAY ONLY. Never applied to logged or
+    captured data — smoothing there would blunt real features. Same length as
+    the input; each point averages up to the last n samples."""
+    if n <= 1 or len(vals) < 2:
+        return list(vals)
+    out, run = [], []
+    for v in vals:
+        run.append(v)
+        if len(run) > n:
+            run.pop(0)
+        out.append(sum(run) / len(run))
+    return out
+
+
+def _median(vals):
+    """Median of a short sequence; None if empty. Used for the fire-instant
+    upstream snapshot: it sits on the true level between quantisation steps and
+    rejects one-off spikes, without the lag a running mean would add over the
+    reservoir's slow drift."""
+    s = sorted(vals)
+    n = len(s)
+    if n == 0:
+        return None
+    m = n // 2
+    return s[m] if n % 2 else 0.5 * (s[m - 1] + s[m])
+
+
 def _capture_stream_fire(lj, rate):
     """Stream AIN2 at *rate*, firing one pulse after CAPTURE_PRE_S.
 
@@ -715,10 +761,14 @@ def _capture_stream_fire(lj, rate):
 
     def _fire():
         # Snapshot the upstream state at the fire instant, before fire_one()
-        # blocks on the ZC1 prompt. This is the pressure that produced the shot.
+        # blocks on the ZC1 prompt. A short median of the most recent Keller
+        # samples sits on the true level between quantisation steps, rather than
+        # whichever side of the ±1 LSB toggle a single reading landed on.
         with _lock:
-            fired['up_bar']  = _state.get('keller_pressure_last')
-            fired['up_degC'] = _state.get('keller_temperature_last')
+            p = _median(_keller_p_recent)
+            t = _median(_keller_t_recent)
+        fired['up_bar']  = round(p, 4) if p is not None else None
+        fired['up_degC'] = round(t, 2) if t is not None else None
         fired['ok'], fired['ot'] = fire_one()
 
     lj.streamConfig(NumChannels=1,
@@ -1253,14 +1303,17 @@ def valve_drive_thread():
 #
 # One output file per session: pvd-sensor_<ts>.csv
 #
-# Each row covers one LOG_INTERVAL_S window. Pulse events that occurred during
-# the window are embedded as semicolon-separated values in the pulse_* columns
-# so that everything needed for analysis is in a single file.
+# The logger flushes on a fixed cadence, but writes one row per raw Keller
+# sample buffered since the last flush, so no upstream sample is dropped. Pulse
+# events that occurred in the window are embedded (semicolon-separated, with
+# their own µs timestamps) on the last row of the flush so everything needed for
+# analysis is in a single file.
 #
 # Columns:
-#   timestamp, keller_pressure_bar (mean), keller_temperature_degC (mean),
+#   timestamp, keller_pressure_bar (raw), keller_temperature_degC (raw),
 #   n_keller_samples, vacuum_chamber_mbar, pulses_interval, pulses_total,
-#   open_time_us, pulse_timestamps_us, pulse_open_times_us, pulse_acks
+#   open_time_us, pulse_timestamps_us, pulse_open_times_us, pulse_acks,
+#   capillary_id_um, capillary_length_mm, gas_species
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def logger_thread():
@@ -1272,9 +1325,9 @@ def logger_thread():
         # when one or more pulses fired in the interval, empty otherwise.
         writer.writerow([
             'timestamp',
-            'keller_pressure_bar',     # mean over interval (None if no samples)
-            'keller_temperature_degC', # mean over interval (None if no samples)
-            'n_keller_samples',        # number of samples averaged
+            'keller_pressure_bar',     # raw sample value for this row (blank if no sample)
+            'keller_temperature_degC', # raw sample value for this row (blank if no sample)
+            'n_keller_samples',        # 1 = this row is a raw sample; 0 = interval with no sample
             'vacuum_chamber_mbar',
             'pulses_interval',
             'pulses_total',
@@ -1292,11 +1345,11 @@ def logger_thread():
         n = 0
         while not _stop.is_set():
             with _lock:
-                p_samp = _state['keller_pressure_samples']
-                t_samp = _state['keller_temperature_samples']
-                p_mean = round(sum(p_samp) / len(p_samp), 4) if p_samp else None
-                t_mean = round(sum(t_samp) / len(t_samp), 2) if t_samp else None
-                n_k    = len(p_samp)
+                # Drain every buffered Keller sample — each becomes its own row,
+                # so no sample is dropped whatever the flush cadence.
+                pending = _keller_log_pending[:]
+                _keller_log_pending.clear()
+                # Bound the GUI-readout buffers (they feed the live mean only).
                 _state['keller_pressure_samples']    = []
                 _state['keller_temperature_samples'] = []
 
@@ -1312,8 +1365,6 @@ def logger_thread():
                 events = _state['pulse_events']
                 _state['pulse_events'] = []
 
-            ts = datetime.now().isoformat(timespec='milliseconds')
-
             if events:
                 pulse_ts   = ';'.join(e[0] for e in events)
                 pulse_ots  = ';'.join(str(e[1]) for e in events)
@@ -1321,11 +1372,29 @@ def logger_thread():
             else:
                 pulse_ts = pulse_ots = pulse_acks = ''
 
-            writer.writerow([
-                ts, p_mean, t_mean, n_k, vac, p_int, p_tot, ot,
-                pulse_ts, pulse_ots, pulse_acks,
-                f"{cap_id:g}", f"{cap_ln:g}", gas,
-            ])
+            cap_s, ln_s = f"{cap_id:g}", f"{cap_ln:g}"
+
+            def _row(ts, p, t, n_k, with_pulses):
+                # Pulses carry their own µs timestamps, so attaching the interval's
+                # pulse list to a single row (not every row) keeps them counted once.
+                return [
+                    ts, p, t, n_k, vac,
+                    (p_int if with_pulses else 0), p_tot, ot,
+                    (pulse_ts   if with_pulses else ''),
+                    (pulse_ots  if with_pulses else ''),
+                    (pulse_acks if with_pulses else ''),
+                    cap_s, ln_s, gas,
+                ]
+
+            if pending:
+                last = len(pending) - 1
+                for i, (sts, sp, st) in enumerate(pending):
+                    writer.writerow(_row(sts, sp, st, 1, with_pulses=(i == last)))
+            else:
+                # No Keller sample this interval (e.g. sensor offline) — still emit
+                # one row so vacuum and any pulses are logged.
+                ts = datetime.now().isoformat(timespec='milliseconds')
+                writer.writerow(_row(ts, None, None, 0, with_pulses=True))
             f.flush()
 
             n += 1
@@ -1729,9 +1798,16 @@ class PVDGui:
             events = list(_events)
         driving = _drive_on.is_set()
 
+        # Display smoothing over the same real time on every chart (their sample
+        # rates differ), plus a matching smoothed value for the vacuum readout so
+        # the number stops chasing gauge noise. Display only — the log is raw.
+        n_k = max(1, round(DISPLAY_SMOOTH_S * KELLER_POLL_HZ))
+        n_v = max(1, round(DISPLAY_SMOOTH_S * LABJACK_SAMPLE_HZ))
+        vac_disp = (sum(vac_chart[-n_v:]) / len(vac_chart[-n_v:])) if vac_chart else vac
+
         p_s  = f"{p:.4f} bar"    if p   is not None else "---"
         t_s  = f"{t:.1f} °C"     if t   is not None else "---"
-        v_s  = f"{vac:.2e} mbar" if vac is not None else "---"
+        v_s  = f"{vac_disp:.2e} mbar" if vac_disp is not None else "---"
         d_s  = f"ON  {rate:g} Hz" if driving else "off"
 
         st = self.status_text
@@ -1751,7 +1827,7 @@ class PVDGui:
         st.insert("end", "TEMPERATURE  ", "dim") ; st.insert("end", t_s + "\n",
                   "bright" if t   is not None else "dim")
         st.insert("end", "VACUUM       ", "dim") ; st.insert("end", v_s + "\n",
-                  "bright" if vac is not None else "dim")
+                  "bright" if vac_disp is not None else "dim")
         st.insert("end", "\n")
         st.insert("end", "PULSES       ", "dim")
         st.insert("end", f"total={ptot}  interval={pint}\n", "bright")
@@ -1771,9 +1847,9 @@ class PVDGui:
             st.insert("end", "none yet\n", "dim")
         st.configure(state="disabled")
 
-        self._draw_chart(self.canvas,      chart,      fmt="{:.3f}")
-        self._draw_chart(self.temp_canvas, temp_chart, fmt="{:.1f}")
-        self._draw_chart(self.vac_canvas,  vac_chart,  fmt="{:.3e}", log=True)
+        self._draw_chart(self.canvas,      _smooth_display(chart, n_k),      fmt="{:.3f}")
+        self._draw_chart(self.temp_canvas, _smooth_display(temp_chart, n_k), fmt="{:.1f}")
+        self._draw_chart(self.vac_canvas,  _smooth_display(vac_chart, n_v),  fmt="{:.3e}", log=True)
 
         text = "\n".join(f"> {s}  {m}" for s, m in events[-200:])
         if getattr(self, "_last_log_text", None) != text:

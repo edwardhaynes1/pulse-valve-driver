@@ -90,7 +90,7 @@ The rig always has a capillary after the valve, so both numbers are required and
 
 **Staleness is the failure mode to guard against.** Nothing checks the values against reality — `cap 500 100` while a 50 µm is installed will confidently mislabel every shot. The driver defends against this by printing a **RUN IDENTITY** banner at startup and keeping the capillary and gas in the status hint at all times. Glance at the banner before capturing; if it is wrong, correct it with `cap` / `gas` first.
 
-**Upstream pressure is handled the other way** — it is read live from the Keller and snapshotted at the fire instant, so it is always correct and needs no setting.
+**Upstream pressure is handled the other way** — it is read live from the Keller and snapshotted at the fire instant, so it is always correct and needs no setting. The snapshot is a short median of the most recent samples (`FIRE_SNAPSHOT_N`), which sits on the true level between the sensor's quantisation steps and ignores one-off spikes, without the lag a running mean would add over the reservoir's slow drift.
 
 **Gas is recorded, not applied.** Setting `gas H2` labels the data but does **not** change the vacuum-gauge conversion, which still reports N₂/air-equivalent pressure. Apply the species factor (H₂ ≈ 2.4, He ≈ 5.9, Ar ≈ 0.8) in analysis — see *Vacuum gauge calibration*.
 
@@ -118,14 +118,14 @@ Written to a `logs/` folder.
 
 ### `pvd-sensor_<timestamp>.csv` — one per session
 
-Sensor readings at the configured cadence, with pulse events embedded in the row covering the interval they occurred in.
+The logger flushes on a fixed cadence but writes **one row per raw Keller sample** buffered since the last flush, so no upstream sample is dropped (the file therefore has roughly `KELLER_POLL_HZ × session-seconds` rows). Pulse events are embedded on the last row of the flush in which they occurred; because each pulse also carries its own microsecond timestamp, which row it lands on doesn't affect analysis.
 
 | Column | Description |
 |---|---|
 | `timestamp` | ISO 8601 |
-| `keller_pressure_bar` | Mean upstream pressure over interval (blank if no samples) |
-| `keller_temperature_degC` | Mean upstream temperature over interval (blank if no samples) |
-| `n_keller_samples` | Number of Keller samples averaged for the row |
+| `keller_pressure_bar` | Raw upstream pressure sample for this row (blank on a no-sample row) |
+| `keller_temperature_degC` | Raw upstream temperature sample for this row (blank on a no-sample row) |
+| `n_keller_samples` | 1 = this row carries a raw Keller sample; 0 = a flush with no sample (e.g. sensor offline) |
 | `vacuum_chamber_mbar` | Vacuum gauge reading |
 | `pulses_interval` | Pulses fired since last row |
 | `pulses_total` | Cumulative pulse count |
@@ -138,6 +138,8 @@ Sensor readings at the configured cadence, with pulse events embedded in the row
 | `gas_species` | Gas at the valve (recorded only; gauge still reads N₂-equivalent) |
 
 Rows with no pulse in their interval leave the three `pulse_*` columns blank, so filtering to pulse rows is simply a matter of selecting rows where `pulse_timestamps_us` is non-empty. The three identity columns are stamped on every row, so a mid-session `cap` / `gas` change is visible as the exact row where the values switch.
+
+**The logged signals are raw, by design.** The upstream channel is logged losslessly — every raw Keller sample gets its own row, nothing averaged or dropped — because smoothing is lossy and one-directional, so it is deferred to where it can always be undone: the live display averages every strip chart and readout over the last `DISPLAY_SMOOTH_S` seconds for readability (so the operator sees a calm signal, not gauge jitter), and `LOG-PLOTTER.py --smooth N` averages the upstream traces at plot time. The stored data keeps full resolution so any averaging choice can be made, and remade, afterwards. (The vacuum column in the log remains a latest-single reading per flush — its high-resolution data is what `pulse_*.csv` is for; the display smoothing above is cosmetic and touches nothing stored. And the at-fire upstream snapshot in a capture is a short median, because there the goal is a single robust value, not a signal to re-filter later.)
 
 ### `pulse_<timestamp>.csv` — one per capture
 
@@ -152,8 +154,8 @@ A commented header of derived values, then the decimated trace with `t = 0` at t
 | `capture_shot_index`, `capture_group_size` | This shot's position in the run, and the run's size |
 | `capillary_id_um`, `capillary_length_mm` | Capillary geometry that produced the shot |
 | `gas_species` | Gas at the valve (recorded only; not applied to the gauge conversion) |
-| `upstream_bar_at_fire` | Upstream pressure snapshotted at the fire instant |
-| `upstream_degC_at_fire` | Upstream temperature snapshotted at the fire instant |
+| `upstream_bar_at_fire` | Upstream pressure at the fire instant (short median of recent samples) |
+| `upstream_degC_at_fire` | Upstream temperature at the fire instant (short median of recent samples) |
 | `p_base_mbar`, `baseline_sd_mbar` | Pre-trigger baseline and its scatter |
 | `peak_mbar`, `dp_mbar` | Peak pressure, and peak above baseline |
 | `t_peak_s`, `t_rise_10_90_s` | Time to peak, and 10–90 % rise time |
@@ -192,11 +194,12 @@ Two further cautions with a limiter fitted. First, Q_pulse then characterises th
 
 ## Companion tools
 
-**`LOG-PLOTTER.py`** — overlay plot of a whole session at the logging cadence. Run with no arguments to open a file picker, or pass a CSV directly. Plots upstream pressure and temperature (top panel, twin axes), vacuum chamber pressure (bottom panel, log scale), and valve-fire events as vertical markers across both. The limiter and gas for the session are shown under the title — the actual values when they held all session, or the transition (`50 µm × 100 mm · N2  →  100 µm × 100 mm · He`) when they were changed mid-session. Logs recorded before the identity columns existed simply show no such caption.
+**`LOG-PLOTTER.py`** — overlay plot of a whole session at the logging cadence. Run with no arguments to open a file picker, or pass a CSV directly. Plots upstream pressure and temperature (top panel, twin axes), vacuum chamber pressure (bottom panel, log scale), and valve-fire events as vertical markers across both. Because the log is raw, `--smooth N` applies an N-row moving average to the upstream traces at plot time (0 = raw). The limiter and gas for the session are shown under the title — the actual values when they held all session, or the transition (`50 µm × 100 mm · N2  →  100 µm × 100 mm · He`) when they were changed mid-session. Logs recorded before the identity columns existed simply show no such caption.
 
 ```bash
 python LOG-PLOTTER.py                    # pick a file, plot whole session
 python LOG-PLOTTER.py log.csv --zoom     # crop to around the pulses
+python LOG-PLOTTER.py log.csv --smooth 7 # 7-row moving average on the upstream traces
 python LOG-PLOTTER.py log.csv --open-time 90    # optional: one open-time only
 ```
 
@@ -226,6 +229,8 @@ ZC1_PORT           = None       # None = auto-detect, or e.g. "COM18"
 DEFAULT_OPEN_US    = 1600       # default valve open time (µs)
 LOG_INTERVAL_S     = 0.5        # sensor log cadence (s)
 KELLER_POLL_HZ     = 4          # Keller sampling rate (Hz)
+FIRE_SNAPSHOT_N    = 5          # recent Keller samples median-ed for the at-fire snapshot
+DISPLAY_SMOOTH_S   = 1.0        # live strip-chart / readout smoothing, seconds — display only (log stays raw)
 
 CAPTURE_RATE_LADDER = (5000, 2500, 2000, 1000, 500)   # Hz, fastest first
 CAPTURE_PRE_S       = 1.0       # baseline recorded before the pulse (s)
