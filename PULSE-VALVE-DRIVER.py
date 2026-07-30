@@ -133,6 +133,25 @@ CHAMBER_VOLUME_L    = 15.586   # geometric estimate (5 combined cylinders); cons
                                # Pending final pump-line-diameter check vs Cornelia's 5 L.
 CHAMBER_LIMIT_MBAR  = 1.0e-6   # the in-chamber limit being demonstrated against
 
+# ─── Run identity (what physically produced these captures) ────────────────────
+# The conductance limiter and the gas are NOT auto-detectable — they change only
+# when hardware is swapped, and nothing in the rig reports them. They are stamped
+# into every capture header and every session row so a file is self-describing
+# and re-analysable without the lab notebook. The catch: a stale value here is
+# WORSE than none, because it mislabels data confidently. Defences: the driver
+# echoes the identity in a banner at startup, keeps it in the status hint at all
+# times, and lets it be changed at runtime (cap / gas commands) so a mid-session
+# swap can be recorded without editing this file and relaunching.
+#
+# Upstream pressure is deliberately NOT here: it is read live from the Keller and
+# stamped at the fire instant, so it can never go stale.
+DEFAULT_CAPILLARY_ID_UM  = 50.0    # limiter bore, micrometres (0 or None = no limiter fitted)
+DEFAULT_CAPILLARY_LEN_MM = 100.0   # limiter length, millimetres
+DEFAULT_CAPILLARY_LABEL  = ""      # free-text batch/serial note, e.g. "batch B, cleaved end"
+DEFAULT_GAS_SPECIES      = "N2"    # gas at the valve. RECORDED ONLY — the gauge conversion
+                                   # still assumes N2/air; apply the species factor
+                                   # (H2~2.4, He~5.9, Ar~0.8) downstream, not here.
+
 FIT_NOISE_K            = 5.0   # stop the decay fit at this x baseline noise
 FIT_MIN_DYNAMIC_RANGE  = 20.0  # need peak excess this far above the noise floor
 FIT_START_FRACTIONS    = (0.7, 0.5, 0.35, 0.25, 0.15)  # candidate fit starts
@@ -178,11 +197,18 @@ _drive_on    = threading.Event()       # set => automatic valve drive is running
 _state       = dict(
     keller_pressure_samples     = [],    # accumulated between log rows, then averaged
     keller_temperature_samples  = [],    # accumulated between log rows, then averaged
+    keller_pressure_last        = None,  # most recent single reading (stamped at fire)
+    keller_temperature_last     = None,  # most recent single reading (stamped at fire)
     vacuum_chamber_mbar         = None,  # latest single reading
     pulse_interval              = 0,     # pulses fired since last log row (reset each row)
     pulses_total                = 0,
     open_time_us                = DEFAULT_OPEN_US,
     drive_rate_hz               = DEFAULT_DRIVE_HZ,
+    # Run identity — what produced the captures. Runtime-settable (cap / gas).
+    capillary_id_um             = DEFAULT_CAPILLARY_ID_UM,
+    capillary_len_mm            = DEFAULT_CAPILLARY_LEN_MM,
+    capillary_label             = DEFAULT_CAPILLARY_LABEL,
+    gas_species                 = DEFAULT_GAS_SPECIES,
     # Pulse event log: list of (iso_timestamp, open_us, ack_ok) since last row
     pulse_events                = [],
 )
@@ -292,9 +318,11 @@ def keller_thread(initial_port: str, initial_bus):
                 with _lock:
                     if p1 is not None:
                         _state['keller_pressure_samples'].append(round(p1, 4))
+                        _state['keller_pressure_last'] = round(p1, 4)
                         _chart.append(p1)
                     if tob1 is not None:
                         _state['keller_temperature_samples'].append(round(tob1, 2))
+                        _state['keller_temperature_last'] = round(tob1, 2)
                         _temp_chart.append(tob1)
                 _stop.wait(timeout=max(0.0, interval - (time.time() - t0)))
 
@@ -306,6 +334,8 @@ def keller_thread(initial_port: str, initial_bus):
         with _lock:
             _state['keller_pressure_samples']    = []
             _state['keller_temperature_samples'] = []
+            _state['keller_pressure_last']       = None
+            _state['keller_temperature_last']    = None
 
         if _stop.is_set():
             break
@@ -672,7 +702,7 @@ def _choose_stream_rate(lj):
 def _capture_stream_fire(lj, rate):
     """Stream AIN2 at *rate*, firing one pulse after CAPTURE_PRE_S.
 
-    Returns (volts, fire_index, fire_ok, open_us, missed).
+    Returns (volts, fire_index, fire_ok, open_us, missed, up_bar, up_degC).
     """
     pre_n   = int(rate * CAPTURE_PRE_S)
     total_n = int(rate * (CAPTURE_PRE_S + CAPTURE_POST_S))
@@ -681,6 +711,11 @@ def _capture_stream_fire(lj, rate):
     fire_idx, fired = None, {}
 
     def _fire():
+        # Snapshot the upstream state at the fire instant, before fire_one()
+        # blocks on the ZC1 prompt. This is the pressure that produced the shot.
+        with _lock:
+            fired['up_bar']  = _state.get('keller_pressure_last')
+            fired['up_degC'] = _state.get('keller_temperature_last')
         fired['ok'], fired['ot'] = fire_one()
 
     lj.streamConfig(NumChannels=1,
@@ -734,7 +769,8 @@ def _capture_stream_fire(lj, rate):
                   f"samples @ {rate:g} Hz — aborted (would have hung)")
 
     return (volts[:total_n], fire_idx,
-            fired.get('ok', False), fired.get('ot'), missed)
+            fired.get('ok', False), fired.get('ot'), missed,
+            fired.get('up_bar'), fired.get('up_degC'))
 
 
 def _decimate(values, factor):
@@ -813,6 +849,40 @@ def _fit_decay(times, mbar, p_base, floor):
     return best
 
 
+def _capillary_str():
+    """Human-readable limiter geometry, e.g. '50 µm × 100 mm (batch B)' or 'none'."""
+    with _lock:
+        idd = _state['capillary_id_um']
+        ln  = _state['capillary_len_mm']
+        lab = _state['capillary_label']
+    if not idd:
+        return "none"
+    s = f"{idd:g} µm × {ln:g} mm"
+    if lab:
+        s += f" ({lab})"
+    return s
+
+
+def _run_conditions(up_bar, up_degC):
+    """Fields describing what produced a capture: limiter geometry, gas, and the
+    upstream state at the fire instant. Merged into every capture header (all
+    outcomes) so a file is self-describing and comparable standalone. Blank
+    fields render as 'n/a' in the plotters rather than being silently dropped."""
+    with _lock:
+        idd = _state['capillary_id_um']
+        ln  = _state['capillary_len_mm']
+        lab = _state['capillary_label']
+        gas = _state['gas_species']
+    return {
+        'capillary_id_um':       f"{idd:g}" if idd else '',
+        'capillary_length_mm':   f"{ln:g}"  if idd else '',
+        'capillary_label':       lab if idd else '',
+        'gas_species':           gas,
+        'upstream_bar_at_fire':  f"{up_bar:.4f}"  if up_bar  is not None else '',
+        'upstream_degC_at_fire': f"{up_degC:.2f}" if up_degC is not None else '',
+    }
+
+
 def _write_capture_csv(times, mbar, meta):
     """Write one capture to its own CSV; return the path."""
     stamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -840,7 +910,8 @@ def _run_capture(lj, shot_index=None):
     log_event(f"CAPTURE{tag}: streaming "
               f"{CAPTURE_PRE_S + CAPTURE_POST_S:g} s @ {rate:g} Hz")
 
-    volts, fire_idx, fire_ok, open_us, missed = _capture_stream_fire(lj, rate)
+    volts, fire_idx, fire_ok, open_us, missed, up_bar, up_degC = \
+        _capture_stream_fire(lj, rate)
     if missed:
         log_event(f"CAPTURE{tag}: {missed} samples missed by the stream")
     if fire_idx is None or len(volts) < CAPTURE_DECIMATE * 20:
@@ -939,7 +1010,8 @@ def _run_capture(lj, shot_index=None):
         _write_capture_csv(times, mbar, {'detected': 0, 'flat_trace': 1,
                                          'capture_rate_hz': rate,
                                          'open_time_us': open_us,
-                                         'zc1_ack': int(bool(fire_ok))})
+                                         'zc1_ack': int(bool(fire_ok)),
+                                         **_run_conditions(up_bar, up_degC)})
         return None
 
     if not detected:
@@ -965,6 +1037,7 @@ def _run_capture(lj, shot_index=None):
             'analysis_rate_hz': 1.0 / dt,
             'open_time_us': open_us,
             'zc1_ack': int(bool(fire_ok)),
+            **_run_conditions(up_bar, up_degC),
             'p_base_mbar': f"{p_base:.6e}",
             'baseline_sd_mbar': f"{sd_pre:.6e}",
             'peak_snr': f"{peak_snr:.2f}",
@@ -1017,6 +1090,7 @@ def _run_capture(lj, shot_index=None):
         'analysis_rate_hz': 1.0 / dt,
         'open_time_us': open_us,
         'zc1_ack': int(bool(fire_ok)),
+        **_run_conditions(up_bar, up_degC),
         'p_base_mbar': f"{p_base:.6e}",
         'baseline_sd_mbar': f"{sd_pre:.6e}",
         'peak_mbar': f"{peak:.6e}",
@@ -1188,6 +1262,10 @@ def logger_thread():
             'pulse_timestamps_us',     # semicolon-separated microsecond timestamps
             'pulse_open_times_us',     # semicolon-separated open times
             'pulse_acks',              # semicolon-separated 1/0 ack flags
+            'capillary_id_um',         # limiter bore in force for this row
+            'capillary_length_mm',     # limiter length in force for this row
+            'capillary_label',         # free-text batch/serial note
+            'gas_species',             # gas in force for this row
         ])
         f.flush()
 
@@ -1207,6 +1285,10 @@ def logger_thread():
                 p_int  = _state['pulse_interval']
                 p_tot  = _state['pulses_total']
                 ot     = _state['open_time_us']
+                cap_id = _state['capillary_id_um']
+                cap_ln = _state['capillary_len_mm']
+                cap_lb = _state['capillary_label']
+                gas    = _state['gas_species']
                 _state['pulse_interval'] = 0
 
                 events = _state['pulse_events']
@@ -1224,6 +1306,9 @@ def logger_thread():
             writer.writerow([
                 ts, p_mean, t_mean, n_k, vac, p_int, p_tot, ot,
                 pulse_ts, pulse_ots, pulse_acks,
+                (f"{cap_id:g}" if cap_id else ''),
+                (f"{cap_ln:g}" if cap_id else ''),
+                (cap_lb if cap_id else ''), gas,
             ])
             f.flush()
 
@@ -1366,12 +1451,29 @@ class PVDGui:
         self._driver_print("PVD — Valve Driver")
         self._driver_print("Pulse Valve Driver · ZC1 controller")
         self._driver_print("")
-        self._driver_print("  v          fire one pulse (no capture)")
-        self._driver_print("  c [n]      capture n pulses at high rate")
-        self._driver_print("  t <µs>     set open time")
-        self._driver_print("  q          quit")
+        self._driver_print("  v              fire one pulse (no capture)")
+        self._driver_print("  c [n]          capture n pulses at high rate")
+        self._driver_print("  t <µs>         set open time")
+        self._driver_print("  cap <id> <len> [label] | cap none   set limiter (µm, mm)")
+        self._driver_print("  gas <species>  set gas (N2, H2, He, Ar…)")
+        self._driver_print("  q              quit")
         self._driver_print("")
+        self._print_identity_banner()
         self._update_hint()
+
+    def _print_identity_banner(self):
+        """Prominent, visually distinct restatement of what will be stamped into
+        every capture and row. This is the staleness defence: if the hardware was
+        swapped and this is wrong, it is impossible to miss. Correct it with the
+        cap / gas commands before capturing."""
+        with _lock:
+            gas = _state['gas_species']
+        self._driver_print("  ┄┄┄ RUN IDENTITY — check before capturing ┄┄┄", "ok")
+        self._driver_print(f"    limiter:  {_capillary_str()}", "ok")
+        self._driver_print(f"    gas:      {gas}", "ok")
+        self._driver_print("    upstream: read live from the Keller, stamped at fire", "dim")
+        self._driver_print("    wrong?  cap <id_µm> <len_mm> [label]   /   gas <species>", "dim")
+        self._driver_print("  ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄", "ok")
 
     def _driver_print(self, line, tag=None):
         self.cmd_text.configure(state="normal")
@@ -1384,13 +1486,18 @@ class PVDGui:
 
     def _update_hint(self):
         with _lock:
-            ot = _state['open_time_us']
+            ot  = _state['open_time_us']
+            idd = _state['capillary_id_um']
+            ln  = _state['capillary_len_mm']
+            gas = _state['gas_species']
+        cap = f"{idd:g}µm×{ln:g}mm" if idd else "no limiter"
+        ident = f"{cap} · {gas}"
         if _capture_busy:
-            self.hint_var.set(f"open={ot} µs  |  CAPTURING…")
+            self.hint_var.set(f"{ident}  |  open={ot} µs  |  CAPTURING…")
         elif _capture_pending > 0:
-            self.hint_var.set(f"open={ot} µs  |  {_capture_pending} shot(s) queued")
+            self.hint_var.set(f"{ident}  |  open={ot} µs  |  {_capture_pending} shot(s) queued")
         else:
-            self.hint_var.set(f"open={ot} µs  | v  c [n]  t <µs>  q")
+            self.hint_var.set(f"{ident}  |  open={ot} µs  | v  c[n]  t  cap  gas  q")
 
     def _on_cmd(self):
         raw = self.cmd_entry.get().strip()
@@ -1398,7 +1505,8 @@ class PVDGui:
         if not raw:
             return
         self._driver_print(f"> {raw}", "dim")
-        parts = raw.lower().split()
+        parts     = raw.lower().split()
+        raw_parts = raw.split()          # original case, for free-text arguments
         cmd   = parts[0]
 
         if cmd == "q":
@@ -1446,6 +1554,23 @@ class PVDGui:
             else:
                 self._driver_print("  usage: t <µs>  (50 – 5 000 000)")
 
+        elif cmd == "cap":
+            # cap none                 -> no limiter fitted
+            # cap <id_µm> <len_mm> [label...]
+            if len(parts) == 2 and parts[1] in ("none", "off", "0"):
+                self._set_capillary(0, 0, "")
+            elif len(parts) >= 3:
+                label = " ".join(raw_parts[3:]) if len(raw_parts) > 3 else ""
+                self._set_capillary(parts[1], parts[2], label)
+            else:
+                self._driver_print("  usage: cap <id_µm> <len_mm> [label]   or   cap none", "err")
+
+        elif cmd == "gas":
+            if len(raw_parts) == 2:
+                self._set_gas(raw_parts[1])
+            else:
+                self._driver_print("  usage: gas <species>  (e.g. N2, H2, He, Ar)", "err")
+
         else:
             self._driver_print(f"  unknown: '{cmd}'", "err")
 
@@ -1479,6 +1604,40 @@ class PVDGui:
         suffix = "" if _zc1_ok else "  (ZC1 offline)"
         self._driver_print(f"  open time → {new_val} µs{suffix}", "ok")
         log_event(f"open time  →  {new_val} µs{suffix}")
+        self._update_hint()
+
+    def _set_capillary(self, id_um, len_mm, label):
+        """Record the limiter now installed. Stamped into every subsequent
+        capture and session row. Set id to 0 (cap none) when running unlimited."""
+        try:
+            idd = float(id_um)
+            ln  = float(len_mm)
+        except (ValueError, TypeError):
+            self._driver_print("  invalid — id and length must be numbers", "err")
+            return
+        if idd < 0 or ln < 0:
+            self._driver_print("  invalid — id and length must be ≥ 0", "err")
+            return
+        with _lock:
+            _state['capillary_id_um']  = idd
+            _state['capillary_len_mm'] = ln
+            _state['capillary_label']  = label
+        desc = _capillary_str()
+        self._driver_print(f"  limiter → {desc}", "ok")
+        log_event(f"limiter  →  {desc}")
+        self._update_hint()
+
+    def _set_gas(self, species):
+        """Record the gas at the valve. RECORDED ONLY — the gauge conversion
+        still assumes N2/air; apply the species factor downstream."""
+        species = species.strip()
+        if not species:
+            self._driver_print("  invalid — give a species, e.g. gas N2", "err")
+            return
+        with _lock:
+            _state['gas_species'] = species
+        self._driver_print(f"  gas → {species}   (gauge still reads N2-equivalent)", "ok")
+        log_event(f"gas  →  {species}")
         self._update_hint()
 
     # ── chart drawing ───────────────────────────────────────────────────────

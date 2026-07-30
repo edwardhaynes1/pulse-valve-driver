@@ -609,6 +609,77 @@ def _mbar_fmt(v, _pos=None):
     return f"{v / 10 ** exp:.1f}×10{_sup(exp)}"
 
 
+def _cap_gas_str(meta):
+    """Limiter geometry + gas from a capture header. Distinguishes three cases:
+    a recorded limiter, an explicit 'no limiter', and a capture predating the
+    identity stamp (shown as 'n/a' rather than silently implying no limiter)."""
+    idd = str(meta.get("capillary_id_um", "")).strip()
+    ln  = str(meta.get("capillary_length_mm", "")).strip()
+    lab = str(meta.get("capillary_label", "")).strip()
+    gas = str(meta.get("gas_species", "")).strip()
+    if idd:
+        cap = f"{idd} µm × {ln} mm" if ln else f"{idd} µm"
+        if lab:
+            cap += f" ({lab})"
+    elif "capillary_id_um" in meta:
+        cap = "no limiter"
+    else:
+        cap = "capillary n/a"
+    return f"{cap}  ·  {gas if gas else 'gas n/a'}"
+
+
+def run_identity_str(meta):
+    """Full one-line 'what produced this shot', incl. upstream pressure at fire."""
+    up = str(meta.get("upstream_bar_at_fire", "")).strip()
+    up_s = f"upstream {up} bar at fire" if up else "upstream n/a"
+    return f"{_cap_gas_str(meta)}  ·  {up_s}"
+
+
+def run_identity_for_records(records):
+    """Collapse per-shot identity across many records into one caption line.
+    Flags 'mixed' if limiter/gas varied; shows an upstream range when the shots
+    spanned different pressures (the confound worth seeing at a glance)."""
+    if not records:
+        return ""
+    idents = {_cap_gas_str(r["meta"]) for r in records}
+    up_vals = []
+    for r in records:
+        up = str(r["meta"].get("upstream_bar_at_fire", "")).strip()
+        if up:
+            try:
+                up_vals.append(float(up))
+            except ValueError:
+                pass
+    if len(idents) != 1:
+        return "mixed limiter / gas across shots — see per-shot headers"
+    cg = idents.pop()
+    if not up_vals:
+        return f"{cg}  ·  upstream n/a"
+    lo, hi = min(up_vals), max(up_vals)
+    up_txt = (f"upstream {lo:.2f} bar at fire" if abs(hi - lo) < 5e-3
+              else f"upstream {lo:.2f}–{hi:.2f} bar across shots")
+    return f"{cg}  ·  {up_txt}"
+
+
+def group_upstream_str(recs):
+    """Compact upstream-pressure tag for a group's legend entry: a single value,
+    or a range when the group's shots weren't at one pressure. Empty if unknown —
+    so it simply doesn't appear on captures predating the stamp."""
+    vals = []
+    for r in recs:
+        up = str(r["meta"].get("upstream_bar_at_fire", "")).strip()
+        if up:
+            try:
+                vals.append(float(up))
+            except ValueError:
+                pass
+    if not vals:
+        return ""
+    lo, hi = min(vals), max(vals)
+    return (f"{lo:.2f} bar" if abs(hi - lo) < 5e-3
+            else f"{lo:.2f}–{hi:.2f} bar")
+
+
 def plot_single(ax, r, xlim, limit, title_extra=""):
     """Full-detail view of one capture: shaded regions and per-shot marks."""
     a, times, mbar, base_fn = r["a"], r["times"], r["mbar"], r["base_fn"]
@@ -692,7 +763,8 @@ def plot_single(ax, r, xlim, limit, title_extra=""):
         ax.spines[sp].set_visible(False)
     ax.set_title(f"Gyger pulse — open {r['open_us']} µs — "
                  f"captured at {r['meta'].get('capture_rate_hz','?')} Hz"
-                 f"{title_extra}", fontsize=12, loc="left")
+                 f"{title_extra}\n{run_identity_str(r['meta'])}",
+                 fontsize=12, loc="left")
     ax.legend(loc="upper right", fontsize=9, framealpha=0.9)
 
 
@@ -736,7 +808,8 @@ def plot_overlay(ax, groups, stats, xlim, limit, use_excess,
                          if xlim[0] <= t <= xlim[1]]
 
         grid, mean = resample_mean(recs, use_excess)
-        label = f"{key} µs  (n = {g['n_good']})"
+        _up = group_upstream_str(recs)
+        label = f"{key} µs  (n = {g['n_good']})" + (f"  @ {_up}" if _up else "")
         if g.get("dp") and g["dp"][0] is not None:
             m, sd, n = g["dp"]
             label += (f"   Δp = {m:.3e}" +
@@ -825,8 +898,9 @@ def plot_overlay(ax, groups, stats, xlim, limit, use_excess,
     for sp in ("top", "right"):
         ax.spines[sp].set_visible(False)
     n_all = sum(len(r) for _, r in groups)
+    _ident = run_identity_for_records([r for _, recs in groups for r in recs])
     ax.set_title(f"Gyger pulse captures — {n_all} shots in "
-                 f"{len(groups)} open-time groups{title_extra}",
+                 f"{len(groups)} open-time groups{title_extra}\n{_ident}",
                  fontsize=12, loc="left")
     ax.legend(loc="upper right", fontsize=9, framealpha=0.9)
 
@@ -894,7 +968,8 @@ def plot_logabs(ax, groups, stats, xlim, limit, title_extra=""):
                 vis.extend(p for tt, p in zip(r["times"], r["mbar"])
                            if t0 <= tt <= t1)
         grid, mean = resample_mean(recs, use_excess=False)
-        lbl = f"{key} µs  (n = {g['n_good']})"
+        _up = group_upstream_str(recs)
+        lbl = f"{key} µs  (n = {g['n_good']})" + (f"  @ {_up}" if _up else "")
         if grid:
             ax.plot(grid, mean, color=colour, lw=2.0, zorder=4, label=lbl)
         else:
@@ -979,8 +1054,9 @@ def plot_logabs(ax, groups, stats, xlim, limit, title_extra=""):
     for sp in ("top", "right"):
         ax.spines[sp].set_visible(False)
     n_all = sum(len(r) for _, r in groups)
+    _ident = run_identity_for_records([r for _, recs in groups for r in recs])
     ax.set_title(f"Gyger pulse — absolute pressure — "
-                 f"{n_all} shot{'' if n_all == 1 else 's'}{title_extra}",
+                 f"{n_all} shot{'' if n_all == 1 else 's'}{title_extra}\n{_ident}",
                  fontsize=12, loc="left")
     ax.legend(loc="upper right", fontsize=9, framealpha=0.9)
 

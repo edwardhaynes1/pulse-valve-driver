@@ -6,7 +6,7 @@ Plots, on a shared time axis, for a single pulsing session:
   • Upstream pressure   (Keller, bar)          — top panel
   • Upstream temperature (Keller, °C)          — overlaid on top panel (right axis)
   • Vacuum chamber pressure (mbar, log scale)  — bottom panel
-  • Pulse events                               — vertical markers on both panels
+  • Valve-fire events                          — vertical markers on both panels
 
 By default the whole log file is plotted. An optional --open-time filter can
 restrict the plot to rows recorded at one valve open-time setting.
@@ -107,6 +107,51 @@ def choose_csv_file():
         print("  invalid choice")
 
 
+def session_identity_str(rows):
+    """One-line limiter + gas caption for a session, from the run-identity
+    columns. Shows the actual setting; if it changed mid-session (the driver
+    allows live cap/gas changes) it lists the states in the order they appeared,
+    joined by →, instead of a bare 'mixed'. Returns '' when the columns are
+    absent (logs predating the stamp) so nothing misleading is shown."""
+    if not rows or "capillary_id_um" not in rows[0]:
+        return ""
+
+    def state(r):
+        idd = (r.get("capillary_id_um") or "").strip()
+        ln  = (r.get("capillary_length_mm") or "").strip()
+        lab = (r.get("capillary_label") or "").strip()
+        gas = (r.get("gas_species") or "").strip()
+        if idd:
+            cap = f"{idd} µm × {ln} mm" if ln else f"{idd} µm"
+            if lab:
+                cap += f" ({lab})"
+        else:
+            cap = "no limiter"
+        return cap, (gas if gas else "gas n/a")
+
+    # distinct (cap, gas) states in order of first appearance
+    seen, order = set(), []
+    for r in rows:
+        cap, gas = state(r)
+        if cap == "no limiter" and gas == "gas n/a":
+            continue                       # wholly blank row — ignore
+        key = (cap, gas)
+        if key not in seen:
+            seen.add(key)
+            order.append(key)
+
+    if not order:
+        return ""
+    if len(order) == 1:
+        cap, gas = order[0]
+        return f"limiter {cap}    ·    gas {gas}"
+    if len(order) <= 3:
+        return "limiter/gas changed:    " + "    →    ".join(
+            f"{cap} · {gas}" for cap, gas in order)
+    return (f"limiter/gas: {len(order)} distinct settings this session "
+            f"— see per-row columns")
+
+
 def main():
     ap = argparse.ArgumentParser(description="Overlay plot of a PVD session")
     ap.add_argument("csv", nargs="?", default=None,
@@ -166,7 +211,9 @@ def main():
         2, 1, figsize=(13, 8), sharex=True,
         gridspec_kw={"height_ratios": [1, 1], "hspace": 0.12},
     )
-    fig.suptitle(f"Pulse valve session — {section}", fontsize=13, y=0.97)
+    _ident = session_identity_str(rows)
+    _sub = f"\n{_ident}" if _ident else ""
+    fig.suptitle(f"Pulse valve session — {section}{_sub}", fontsize=13, y=0.97)
 
     # Colours
     C_P   = "#1f5fd0"   # upstream pressure  (blue)
@@ -192,11 +239,12 @@ def main():
     ax_bot.set_ylabel("Vacuum chamber (mbar)")
     ax_bot.grid(True, which="both", alpha=0.25)
 
-    # ── Pulse markers on both panels ───────────────────────────────────────
-    for i, pt in enumerate(pulse_times):
+    # ── Valve-fire markers on both panels ──────────────────────────────────
+    # Drawn unlabeled; a single proxy handle is added to each legend below, so
+    # the marker shows once per panel rather than once per line it crosses.
+    for pt in pulse_times:
         for ax in (ax_top, ax_bot):
-            ax.axvline(pt, color=C_PLS, lw=1.4,
-                       label="Pulse" if (i == 0 and ax is ax_top) else None)
+            ax.axvline(pt, color=C_PLS, lw=1.4)
 
     # ── Optional zoom: crop x-axis to a margin around the pulses ───────────
     if args.zoom and pulse_times:
@@ -212,18 +260,28 @@ def main():
     ax_bot.set_xlabel("Time")
     fig.autofmt_xdate(rotation=0, ha="center")
 
-    # ── Combined legend on the top panel ───────────────────────────────────
-    lines, labels = [], []
+    # ── Legends: built explicitly so the fire marker appears exactly once per
+    #    panel, after the data series, with a self-explanatory label ──────────
+    from matplotlib.lines import Line2D
+    pulse_proxy = Line2D([0], [0], color=C_PLS, lw=1.4)
+    pulse_label = (f"valve fired  (×{len(pulse_times)})"
+                   if len(pulse_times) != 1 else "valve fired")
+
+    top_lines, top_labels = [], []
     for ax in (ax_top, ax_temp):
         for ln, lb in zip(*ax.get_legend_handles_labels()):
-            lines.append(ln); labels.append(lb)
-    # add pulse marker to legend once
+            top_lines.append(ln); top_labels.append(lb)
     if pulse_times:
-        from matplotlib.lines import Line2D
-        lines.append(Line2D([0], [0], color=C_PLS, lw=1.4))
-        labels.append("Pulse")
-    ax_top.legend(lines, labels, loc="upper right", fontsize=9, framealpha=0.9)
-    ax_bot.legend(loc="upper right", fontsize=9, framealpha=0.9)
+        top_lines.append(pulse_proxy); top_labels.append(pulse_label)
+    ax_top.legend(top_lines, top_labels, loc="upper right",
+                  fontsize=9, framealpha=0.9)
+
+    bot_lines, bot_labels = ax_bot.get_legend_handles_labels()
+    bot_lines, bot_labels = list(bot_lines), list(bot_labels)
+    if pulse_times:
+        bot_lines.append(pulse_proxy); bot_labels.append(pulse_label)
+    ax_bot.legend(bot_lines, bot_labels, loc="upper right",
+                  fontsize=9, framealpha=0.9)
 
     # subplots_adjust rather than tight_layout — twinx axes aren't tight-safe
     fig.subplots_adjust(left=0.08, right=0.92, top=0.93, bottom=0.08, hspace=0.12)
