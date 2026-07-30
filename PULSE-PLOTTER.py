@@ -11,14 +11,15 @@ cadence. This one plots individual shots in detail.
 One capture:
   • Chamber pressure vs time, t = 0 at the fire command
   • Baseline, peak, dp and time-to-peak marked
-  • Rise (10–90 %) and decay-fit regions shaded
-  • S_eff and Q_pulse (both routes) shown in a summary box
+  • Rise (10–90 %), fast-decay and slow-tail regions shaded
+  • τ_fast, τ_slow, S_eff and Q_pulse shown in a summary box
 
 Several captures:
   • All traces overlaid on a common time axis, aligned at the fire
   • Grouped and coloured by valve open time, with a bold group-mean trace
   • Annotations show the GROUP MEAN peak and time-to-peak, not one shot
-  • Per-group statistics table: dp, t_peak, rise, tau, S_eff, Q_pulse,
+  • Per-group statistics table: dp, t_peak, rise, τ_fast, τ_slow, S_eff,
+    Q_pulse,
     each as mean ± standard deviation across the shots in that group
 
 Traces are plotted as excess above each capture's OWN baseline, because
@@ -32,6 +33,22 @@ middle value.
 
 Everything is recomputed from the raw trace, so the chamber volume can be
 changed after the fact without retaking any data.
+
+Two time constants
+-------------------
+The decay is fit twice. τ_fast is the chamber pumping down through the
+capillary, and it is the one that sets throughput: S_eff = V / τ_fast.
+τ_slow, when it can be resolved, is the slower fall left in the tail — on
+this rig the hypothesis is gas still bleeding out of the capillary volume.
+
+τ_slow is deliberately conservative: it is reported only when the tail
+clears the noise floor AND comes out genuinely slower than τ_fast, and is
+otherwise shown as "not resolved" rather than printing a number that is
+really noise. Because the slow tail is small, the drift baseline can eat it
+— its far-tail anchor assumes the pulse has vanished there, which a real
+slow tail has not — so use --baseline mean when chasing τ_slow, and give it
+a capture window several τ_slow long. Averaging many shots (the group mean)
+is the surest way to lift the tail clear of the noise.
 
 Baseline estimators (--baseline)
 --------------------------------
@@ -99,6 +116,23 @@ TAIL_FRAC = 0.75        # far-tail anchor starts this far through the window
 FIT_NOISE_K = 5.0       # stop the decay fit at this × the residual scatter
 FIT_START_FRACTIONS = (0.7, 0.5, 0.35, 0.25, 0.15)
 FIT_MIN_POINTS = 20
+# Fit only the FAST component: stop once the excess falls below this fraction
+# of the peak, so a slow wall-desorption tail can't drag τ (and hence S_eff)
+# high. On a clean single-exponential shot this changes nothing — any segment
+# of a straight log-decay gives the same slope — and on small shots the noise
+# floor is reached first, so it only bites when there is a real slow tail.
+FIT_FAST_FRAC = 0.2
+
+# Slow tail (τ_slow): a second single-exponential fit over the window BELOW the
+# fast region and ABOVE the noise floor. It only reports when that window holds
+# enough points clear of the noise, fits a straight log-line well, and resolves
+# as genuinely slower than τ_fast — otherwise "not resolved", so a noise-driven
+# tail never masquerades as a measurement.
+FIT_SLOW_MIN_POINTS = 25
+FIT_SLOW_MIN_R2 = 0.80
+FIT_SLOW_MIN_RATIO = 1.8   # τ_slow must exceed this × τ_fast to count as distinct
+FIT_SLOW_SETTLE = 3.0      # start ≥ this × τ_fast past the peak, so fast is gone
+FIT_SLOW_BREAK_N = 5       # end after this many consecutive points below the floor
 
 # Auto time-window: how far right to draw so the return to baseline is shown.
 RETURN_K = 3.0          # excess is "back to baseline" below this × scatter
@@ -289,6 +323,9 @@ def fit_decay(times, excess, floor):
         return None
 
     best = None
+    # Fit only where the fast component dominates: down to FIT_FAST_FRAC of the
+    # peak, or the noise floor, whichever is higher.
+    fit_floor = max(floor, FIT_FAST_FRAC * peak)
     for frac in FIT_START_FRACTIONS:
         i0 = next((i for i in range(i_peak, len(excess))
                    if excess[i] <= frac * peak), None)
@@ -296,7 +333,7 @@ def fit_decay(times, excess, floor):
             continue
         xs, ys = [], []
         for t, e in zip(times[i0:], excess[i0:]):
-            if e <= floor:
+            if e <= fit_floor:
                 break
             xs.append(t)
             ys.append(math.log(e))
@@ -314,6 +351,55 @@ def fit_decay(times, excess, floor):
         if best is None or r2 > best["r2"]:
             best = cand
     return best
+
+
+def fit_slow(times, excess, i_peak, peak, floor, tau_fast, t_peak):
+    """Single-exponential fit of the SLOW tail, below the fast region.
+
+    Returns a dict shaped like fit_decay's, or None when the tail can't be
+    trusted: too few points above the noise floor, a poor straight-line fit on
+    the log axis, or a time constant not meaningfully slower than τ_fast (in
+    which case the "tail" is just noise or leftover fast decay). The window runs
+    from FIT_FAST_FRAC·peak down to the noise floor, starting only once the fast
+    component has had FIT_SLOW_SETTLE τ_fast to die away.
+    """
+    if not tau_fast or tau_fast <= 0:
+        return None
+    lo = floor                        # noise floor (already FIT_NOISE_K · sd)
+    hi = FIT_FAST_FRAC * peak         # top of the slow window (bottom of fast)
+    if hi <= lo:                      # no gap between fast region and noise
+        return None
+    t_start = t_peak + FIT_SLOW_SETTLE * tau_fast
+
+    xs, ys, below = [], [], 0
+    for t, e in zip(times[i_peak:], excess[i_peak:]):
+        if t < t_start or e >= hi:
+            continue
+        if e <= lo:                   # into the noise — end after a sustained run
+            below += 1
+            if below >= FIT_SLOW_BREAK_N:
+                break
+            continue
+        below = 0
+        xs.append(t)
+        ys.append(math.log(e))
+
+    if len(xs) < FIT_SLOW_MIN_POINTS:
+        return None
+    slope, icept = _linfit(list(zip(xs, ys)))
+    if slope >= 0:
+        return None
+    tau = -1.0 / slope
+    if tau < FIT_SLOW_MIN_RATIO * tau_fast:
+        return None
+    my = sum(ys) / len(ys)
+    ss_res = sum((y - (slope * x + icept)) ** 2 for x, y in zip(xs, ys))
+    ss_tot = sum((y - my) ** 2 for y in ys)
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
+    if r2 < FIT_SLOW_MIN_R2:
+        return None
+    return dict(tau=tau, r2=r2, n=len(xs), t0=xs[0], t1=xs[-1],
+                slope=slope, icept=icept)
 
 
 def analyse(times, mbar, base_fn, sd, volume_l):
@@ -336,11 +422,16 @@ def analyse(times, mbar, base_fn, sd, volume_l):
     fit = fit_decay(post_t, post_e, FIT_NOISE_K * sd)
     a = dict(peak=peak, dp=dp, t_peak=t_peak, t10=t10, t90=t90,
              integral=integral, fit=fit, dt=dt, sd=sd, volume_l=volume_l,
-             q_vdp=volume_l * dp, post_t=post_t, post_e=post_e)
+             q_vdp=volume_l * dp, post_t=post_t, post_e=post_e,
+             tau_slow=None, fit_slow=None)
     if fit:
-        a["tau"] = fit["tau"]
+        a["tau"] = fit["tau"]        # τ_fast — the chamber-reset constant
         a["s_eff"] = volume_l / fit["tau"]
         a["q_int"] = a["s_eff"] * integral
+        slow = fit_slow(post_t, post_e, i_pk, dp, FIT_NOISE_K * sd,
+                        fit["tau"], t_peak)
+        a["fit_slow"] = slow
+        a["tau_slow"] = slow["tau"] if slow else None
     return a
 
 
@@ -431,6 +522,7 @@ def group_stats(recs):
                          for r in good])
     g["integral"] = mean_sd(pick("integral"))
     g["tau"] = mean_sd(pick("tau"))
+    g["tau_slow"] = mean_sd(pick("tau_slow"))
     g["s_eff"] = mean_sd(pick("s_eff"))
     g["q_int"] = mean_sd(pick("q_int"))
     g["base"] = mean_sd([r["base_fn"](0.0) for r in good])
@@ -478,6 +570,7 @@ C_BASE = "#7a7a7a"
 C_FIRE = "#c03030"
 C_RISE = "#d9772b"
 C_FIT = "#1d9e75"
+C_SLOW = "#9b59b6"
 C_ANN = "#4a4a4a"
 
 # Fixed order, so a given open time keeps its colour between runs.
@@ -527,7 +620,13 @@ def plot_single(ax, r, xlim, limit, title_extra=""):
                    label=f"rise 10–90 %  ({(a['t90']-a['t10'])*1000:.0f} ms)")
     if a.get("fit"):
         ax.axvspan(a["fit"]["t0"], a["fit"]["t1"], color=C_FIT, alpha=0.13,
-                   lw=0, label=f"decay fit  (τ = {a['tau']*1000:.1f} ms)")
+                   lw=0,
+                   label=f"fast decay  (τ_fast = {a['tau']*1000:.1f} ms)")
+    if a.get("fit_slow"):
+        fs = a["fit_slow"]
+        ax.axvspan(fs["t0"], fs["t1"], color=C_SLOW, alpha=0.13, lw=0,
+                   label=f"slow tail  (τ_slow = {fs['tau']*1000:.0f} ms, "
+                         f"r² {fs['r2']:.2f})")
 
     ax.plot(times, [p / scale for p in mbar], color=PALETTE[0], lw=1.4, zorder=3)
     ax.plot(times, [base_fn(t) / scale for t in times], color=C_BASE,
@@ -569,7 +668,13 @@ def plot_single(ax, r, xlim, limit, title_extra=""):
     # side is the cross-check.
     vol = r["volume"]
     if a.get("fit"):
-        box = (f"S_eff   {a['s_eff']:.1f} L/s   (V/τ,  V = {vol:g} L)\n"
+        tau_line = f"τ_fast  {a['tau']*1000:.0f} ms"
+        if a.get("tau_slow"):
+            tau_line += f"     τ_slow  {a['tau_slow']*1000:.0f} ms"
+        else:
+            tau_line += "     τ_slow  not resolved"
+        box = (f"{tau_line}\n"
+               f"S_eff   {a['s_eff']:.1f} L/s   (V/τ_fast,  V = {vol:g} L)\n"
                f"Q_pulse {a['q_int']:.3e} mbar·L   (S_eff × ∫)\n"
                f"        {a['q_vdp']:.3e} mbar·L   (V × Δp)")
     else:
@@ -701,7 +806,9 @@ def plot_overlay(ax, groups, stats, xlim, limit, use_excess,
             parts[0] += f" ± {g['dp'][1]:.1e}"
         parts.append(f"t_peak {g['t_peak'][0]*1000:.0f} ms")
         if g.get("tau") and g["tau"][0] is not None:
-            parts.append(f"τ {g['tau'][0]*1000:.0f} ms")
+            parts.append(f"τ_fast {g['tau'][0]*1000:.0f} ms")
+        if g.get("tau_slow") and g["tau_slow"][0] is not None:
+            parts.append(f"τ_slow {g['tau_slow'][0]*1000:.0f} ms")
         if g.get("s_eff") and g["s_eff"][0] is not None:
             parts.append(f"S_eff {g['s_eff'][0]:.0f} L/s")
         if g.get("q_int") and g["q_int"][0] is not None:
@@ -742,9 +849,11 @@ def plot_logpanel(ax, groups, stats, use_excess):
         g = stats[key]
         lab = f"{key} µs"
         if g.get("tau") and g["tau"][0] is not None:
-            lab += f"   τ = {g['tau'][0]*1000:.1f} ms"
+            lab += f"   τ_fast = {g['tau'][0]*1000:.1f} ms"
             if g["tau"][1] is not None:
                 lab += f" ± {g['tau'][1]*1000:.1f}"
+        if g.get("tau_slow") and g["tau_slow"][0] is not None:
+            lab += f"   τ_slow = {g['tau_slow'][0]*1000:.0f} ms"
         ax.semilogy([t for t, _ in pts], [y for _, y in pts],
                     color=colour, lw=1.6, label=lab)
         ax.axhline(floor, color=C_BASE, ls=":", lw=0.8)
@@ -809,13 +918,16 @@ def plot_logabs(ax, groups, stats, xlim, limit, title_extra=""):
             if g.get("t_peak") and g["t_peak"][0] is not None:
                 parts.append(f"t_peak {g['t_peak'][0]*1000:.0f} ms")
             if g.get("tau") and g["tau"][0] is not None:
-                parts.append(f"τ {g['tau'][0]*1000:.0f} ms")
+                parts.append(f"τ_fast {g['tau'][0]*1000:.0f} ms")
+            if g.get("tau_slow") and g["tau_slow"][0] is not None:
+                parts.append(f"τ_slow {g['tau_slow'][0]*1000:.0f} ms")
             if g.get("s_eff") and g["s_eff"][0] is not None:
                 parts.append(f"S_eff {g['s_eff'][0]:.0f} L/s")
             if g.get("q_int") and g["q_int"][0] is not None:
                 parts.append(f"Q_pulse {g['q_int'][0]:.2e} mbar·L")
-            ax.annotate("\n".join(parts), xy=(0.30, 0.96 - 0.17 * gi),
-                        xycoords="axes fraction", va="top", ha="left",
+            ax.annotate("\n".join(parts), xy=(tp, pk),
+                        xytext=(12, -2 - 14 * gi), textcoords="offset points",
+                        va="top", ha="left",
                         fontsize=9, color=colour, zorder=7,
                         bbox=dict(boxstyle="round,pad=0.4", fc="white",
                                   ec=colour, lw=0.8, alpha=0.9))
@@ -862,13 +974,14 @@ def plot_logabs(ax, groups, stats, xlim, limit, title_extra=""):
     ax.yaxis.set_minor_formatter(NullFormatter())
 
     ax.set_xlabel("Time from valve fire (s)")
-    ax.set_ylabel("Chamber pressure (mbar, log scale)")
+    ax.set_ylabel("Chamber pressure (mbar)")
     ax.grid(True, which="both", alpha=0.2)
     for sp in ("top", "right"):
         ax.spines[sp].set_visible(False)
     n_all = sum(len(r) for _, r in groups)
-    ax.set_title(f"Gyger pulse — absolute pressure, log scale — "
-                 f"{n_all} shot(s){title_extra}", fontsize=12, loc="left")
+    ax.set_title(f"Gyger pulse — absolute pressure — "
+                 f"{n_all} shot{'' if n_all == 1 else 's'}{title_extra}",
+                 fontsize=12, loc="left")
     ax.legend(loc="upper right", fontsize=9, framealpha=0.9)
 
 
@@ -916,12 +1029,33 @@ def report_single(r, args):
     if a.get("fit"):
         f = a["fit"]
         print()
-        print(f"tau          {a['tau']*1000:.1f} ms  r² {f['r2']:.4f}  "
+        print(f"tau_fast     {a['tau']*1000:.1f} ms  r² {f['r2']:.4f}  "
               f"{f['n']} pts, fit from {f['t0']*1000:.0f} to "
               f"{f['t1']*1000:.0f} ms")
         print(f"  half-life  {a['tau']*math.log(2)*1000:.0f} ms   "
-              f"back to baseline (5 τ) in {a['tau']*5*1000:.0f} ms")
-        print(f"S_eff        {a['s_eff']:.1f} L/s  (= V / τ, V = {r['volume']:g} L)")
+              f"back to baseline (5 τ_fast) in {a['tau']*5*1000:.0f} ms")
+        if a.get("fit_slow"):
+            fs = a["fit_slow"]
+            print(f"tau_slow     {fs['tau']*1000:.0f} ms  r² {fs['r2']:.4f}  "
+                  f"{fs['n']} pts, fit from {fs['t0']*1000:.0f} to "
+                  f"{fs['t1']*1000:.0f} ms")
+            print(f"  ratio      τ_slow/τ_fast = {fs['tau']/a['tau']:.1f}   "
+                  f"(hypothesis: capillary emptying)")
+            if args.baseline == "drift":
+                print("  NOTE: τ_slow on the drift baseline is fragile — its "
+                      "far-tail anchor")
+                print("  assumes the pulse is gone there, but a real slow tail "
+                      "is not, so drift")
+                print("  can subtract part of it. Cross-check with --baseline "
+                      "mean.")
+        else:
+            print("tau_slow     not resolved — the tail is at or below the "
+                  "noise floor")
+            print("  (need a bigger Δp, more shots averaged, or a longer "
+                  "capture to pull")
+            print("  it clear of the noise; --baseline mean helps too)")
+        print(f"S_eff        {a['s_eff']:.1f} L/s  (= V / τ_fast, "
+              f"V = {r['volume']:g} L)")
         print(f"Q_pulse      {a['q_int']:.4e} mbar·L  = S_eff × integral")
         print(f"             {a['q_vdp']:.4e} mbar·L  = V × Δp")
         ratio = a["q_vdp"] / a["q_int"] if a["q_int"] else float("nan")
@@ -935,7 +1069,7 @@ def report_single(r, args):
                 print("  is not impulsive: V × Δp under-reads. Use the "
                       "integral route.")
         if a["tau"] * 5 > bl["_tail_start"]:
-            print(f"  WARNING: 5 τ ({a['tau']*5:.2f} s) reaches past the "
+            print(f"  WARNING: 5 τ_fast ({a['tau']*5:.2f} s) reaches past the "
                   f"far-tail")
             print(f"  anchor at {bl['_tail_start']:.2f} s, so the drift "
                   f"baseline may")
@@ -959,8 +1093,8 @@ def report_groups(groups, stats, args, volume):
               f"{fmt_ms(*g['t_peak']):>16} {fmt_ms(*g['rise']):>16}")
 
     print()
-    print(f"{'open':>7} {'tau (ms)':>18} {'S_eff (L/s)':>18} "
-          f"{'Q_pulse (mbar·L)':>26}")
+    print(f"{'open':>7} {'tau_fast (ms)':>18} {'tau_slow (ms)':>16} "
+          f"{'S_eff (L/s)':>16} {'Q_pulse (mbar·L)':>26}")
     for key, recs in groups:
         g = stats[key]
         if not g.get("tau") or g["tau"][0] is None:
@@ -968,9 +1102,12 @@ def report_groups(groups, stats, args, volume):
             continue
         m, sd, n = g["s_eff"]
         s_eff = f"{m:.1f}" + (f" ± {sd:.1f}" if sd is not None else "")
-        print(f"{key:>5} µs {fmt_ms(*g['tau']):>18} {s_eff:>18} "
-              f"{fmt_sci(*g['q_int']):>26}")
-    print(f"\n  (S_eff and Q_pulse assume V = {volume:g} L)")
+        tau_slow = (fmt_ms(*g["tau_slow"])
+                    if g.get("tau_slow") and g["tau_slow"][0] is not None
+                    else "not resolved")
+        print(f"{key:>5} µs {fmt_ms(*g['tau']):>18} {tau_slow:>16} "
+              f"{s_eff:>16} {fmt_sci(*g['q_int']):>26}")
+    print(f"\n  (S_eff and Q_pulse assume V = {volume:g} L;  S_eff = V/τ_fast)")
 
     for key, recs in groups:
         g = stats[key]
@@ -981,16 +1118,17 @@ def report_groups(groups, stats, args, volume):
                 if not r["detected"]:
                     print(f"    {r['name']}")
 
-    # τ is a chamber property: it should not depend on the open time.
+    # τ_fast is a chamber property: it should not depend on the open time.
     taus = [(k, stats[k]["tau"][0]) for k, _ in groups
             if stats[k].get("tau") and stats[k]["tau"][0] is not None]
     if len(taus) > 1:
         lo = min(t for _, t in taus)
         hi = max(t for _, t in taus)
         if hi / lo > 1.15:
-            print(f"\n  NOTE: τ varies from {lo*1000:.0f} to {hi*1000:.0f} ms "
-                  f"between groups.")
-            print("  τ is a property of the chamber, not the pulse, so this is")
+            print(f"\n  NOTE: τ_fast varies from {lo*1000:.0f} to "
+                  f"{hi*1000:.0f} ms between groups.")
+            print("  τ_fast is a property of the chamber, not the pulse, so "
+                  "this is")
             print("  the fit degrading on the smaller shots rather than a real")
             print("  change. Take τ from the largest pulses.")
 
