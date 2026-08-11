@@ -34,6 +34,22 @@ middle value.
 Everything is recomputed from the raw trace, so the chamber volume can be
 changed after the fact without retaking any data.
 
+Run identity
+------------
+Under each plot title is a caption naming what produced the shot: the
+downstream capillary, the upstream capillary, the gas, and the upstream
+pressure at the fire instant — e.g.
+
+  down 50 µm × 100 mm  ·  up 130 µm × 100 mm  ·  H2  ·  upstream P 3.12 bar at fire
+
+In an overlay the caption collapses to one line, flagging `mixed` if the
+shots did not share a configuration, and showing a pressure range when they
+spanned several. Captures written before the up/downstream split carry the
+single legacy `capillary_*` pair, which is the downstream limiter under its
+old name and is read as such; their upstream capillary shows `n/a`, not
+`none`, because those files recorded no upstream field at all and not
+knowing is different from knowing there was none.
+
 Two time constants
 -------------------
 The decay is fit twice. τ_fast is the chamber pumping down through the
@@ -609,30 +625,61 @@ def _mbar_fmt(v, _pos=None):
     return f"{v / 10 ** exp:.1f}×10{_sup(exp)}"
 
 
+def _one_cap_str(idd, ln):
+    """Format one capillary's geometry. '' means the field was absent (unknown);
+    an explicit 0 means none fitted — a real, recorded state, not a gap."""
+    if not idd:
+        return None                      # unknown — caller decides how to say so
+    try:
+        if float(idd) <= 0:
+            return "none"
+    except ValueError:
+        pass
+    return f"{idd} µm × {ln} mm" if ln else f"{idd} µm"
+
+
 def _cap_gas_str(meta):
-    """Capillary geometry + gas from a capture header. Shows 'n/a' for captures
-    that predate the identity stamp (fields absent), never implying a bore."""
-    idd = str(meta.get("capillary_id_um", "")).strip()
-    ln  = str(meta.get("capillary_length_mm", "")).strip()
-    gas = str(meta.get("gas_species", "")).strip()
-    if idd:
-        cap = f"{idd} µm × {ln} mm" if ln else f"{idd} µm"
+    """Both capillaries + gas from a capture header.
+
+    Captures written before the up/downstream split carry the single legacy
+    pair (capillary_id_um / capillary_length_mm), which is the *downstream*
+    limiter under its old name — so it is read as such. Those files recorded no
+    upstream capillary at all, and an absent field is reported 'n/a' rather than
+    'none': not knowing whether one was fitted is different from knowing none
+    was, and only the second is a fact about the rig.
+    """
+    d_id = str(meta.get("downstream_cap_id_um",
+                        meta.get("capillary_id_um", ""))).strip()
+    d_ln = str(meta.get("downstream_cap_length_mm",
+                        meta.get("capillary_length_mm", ""))).strip()
+    u_id = str(meta.get("upstream_cap_id_um", "")).strip()
+    u_ln = str(meta.get("upstream_cap_length_mm", "")).strip()
+    gas  = str(meta.get("gas_species", "")).strip()
+
+    d_txt = _one_cap_str(d_id, d_ln)
+    u_txt = _one_cap_str(u_id, u_ln)
+
+    if d_txt is None and u_txt is None:
+        cap = "capillary n/a"            # pre-identity capture: say nothing more
     else:
-        cap = "capillary n/a"
+        cap = (f"down {d_txt if d_txt else 'n/a'}"
+               f"  ·  up {u_txt if u_txt else 'n/a'}")
     return f"{cap}  ·  {gas if gas else 'gas n/a'}"
 
 
 def run_identity_str(meta):
     """Full one-line 'what produced this shot', incl. upstream pressure at fire."""
     up = str(meta.get("upstream_bar_at_fire", "")).strip()
-    up_s = f"upstream {up} bar at fire" if up else "upstream n/a"
+    # 'upstream P', not 'upstream': the caption now also names an upstream
+    # *capillary*, and the two must not read as the same thing.
+    up_s = f"upstream P {up} bar at fire" if up else "upstream P n/a"
     return f"{_cap_gas_str(meta)}  ·  {up_s}"
 
 
 def run_identity_for_records(records):
     """Collapse per-shot identity across many records into one caption line.
-    Flags 'mixed' if limiter/gas varied; shows an upstream range when the shots
-    spanned different pressures (the confound worth seeing at a glance)."""
+    Flags 'mixed' if capillaries/gas varied; shows an upstream range when the
+    shots spanned different pressures (the confound worth seeing at a glance)."""
     if not records:
         return ""
     idents = {_cap_gas_str(r["meta"]) for r in records}
@@ -645,13 +692,13 @@ def run_identity_for_records(records):
             except ValueError:
                 pass
     if len(idents) != 1:
-        return "mixed limiter / gas across shots — see per-shot headers"
+        return "mixed capillaries / gas across shots — see per-shot headers"
     cg = idents.pop()
     if not up_vals:
-        return f"{cg}  ·  upstream n/a"
+        return f"{cg}  ·  upstream P n/a"
     lo, hi = min(up_vals), max(up_vals)
-    up_txt = (f"upstream {lo:.2f} bar at fire" if abs(hi - lo) < 5e-3
-              else f"upstream {lo:.2f}–{hi:.2f} bar across shots")
+    up_txt = (f"upstream P {lo:.2f} bar at fire" if abs(hi - lo) < 5e-3
+              else f"upstream P {lo:.2f}–{hi:.2f} bar across shots")
     return f"{cg}  ·  {up_txt}"
 
 
