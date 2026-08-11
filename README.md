@@ -25,7 +25,7 @@ isolation valve → **pulse valve** → conductance limiter → vacuum chamber (
 - **Pulse capture**: hardware-streamed chamber pressure through a single shot, with the valve fired automatically inside the capture window
 - Automatic analysis of each capture — peak, Δp, rise time, decay constant, effective pumping speed, gas delivered per pulse
 - **Run identity**: limiter bore/length and gas are recorded with every capture and row and can be changed live; upstream pressure and temperature are snapshotted at the fire instant
-- Single timestamped CSV per session with per-pulse events embedded inline (microsecond resolution), plus one CSV per capture
+- Single timestamped CSV per session with per-pulse events embedded inline (microsecond resolution), plus one CSV per capture and a per-session capture manifest summarising every shot in one table
 - Auto-detection of serial devices on any COM port, with automatic reconnection if a device disconnects mid-session
 - Tkinter GUI: live readouts, three synchronised strip charts (upstream pressure, upstream temperature, vacuum chamber), and a valve driver terminal
 - Companion tools for plotting sessions, plotting single captures, and diagnosing the vacuum gauge
@@ -70,7 +70,8 @@ python PULSE-VALVE-DRIVER.py
 | `v` | Fire one pulse, no capture |
 | `c [n]` | Capture n pulses at high rate (default 1, max 50) |
 | `t <µs>` | Set open time (50 – 5 000 000 µs) |
-| `cap <id_µm> <len_mm>` | Record the installed capillary (bore in µm, length in mm) |
+| `cap <up\|down> <id_µm> <len_mm>` | Record a capillary on the given side (bore in µm, length in mm) |
+| `cap up none` | Record that no upstream capillary is fitted |
 | `gas <species>` | Record the gas at the valve (e.g. `N2`, `H2`, `He`, `Ar`) |
 | `q` | Quit |
 
@@ -80,15 +81,19 @@ The open time in force is shown in the driver window, recorded in every session 
 
 The capillary geometry and the gas cannot be detected by any instrument — they change only when hardware is physically swapped. They are held as live settings, seeded at startup from the configuration block and changeable at any time with `cap` and `gas`. Whatever is in force is stamped into every subsequent capture header and session row.
 
+Two capillaries are recorded independently. The **downstream** one is the conductance limiter after the valve, into the chamber — it sets chamber conductance and shapes the decay, and the Gyger is never run without it, so it is always fitted. The **upstream** one is the feed capillary before the valve, on the reservoir side; it is not always present, and `cap up none` records that.
+
 ```
-cap 50 100     # 50 µm bore, 100 mm (= 10 cm) long. NOTE: length is in mm.
-cap 41.5 100   # non-integer bore is fine (record as-measured, not nominal)
-gas N2         # gas at the valve
+cap down 50 100    # downstream: 50 µm bore, 100 mm (= 10 cm) long. NOTE: length is in mm.
+cap down 41.5 100  # non-integer bore is fine (record as-measured, not nominal)
+cap up 130 100     # upstream feed capillary
+cap up none        # no upstream capillary fitted
+gas N2             # gas at the valve
 ```
 
-The rig always has a capillary after the valve, so both numbers are required and must be positive; `cap 50` alone, or a zero/negative value, is rejected. The numbers are parsed as floats.
+Both numbers are required and must be positive; `cap down 50` alone, or a zero/negative value, is rejected. The numbers are parsed as floats. The side may be abbreviated (`u`/`d`). Only the upstream side can be cleared with `none` — the downstream capillary is always present on this rig, so there is no way to record its absence.
 
-**Staleness is the failure mode to guard against.** Nothing checks the values against reality — `cap 500 100` while a 50 µm is installed will confidently mislabel every shot. The driver defends against this by printing a **RUN IDENTITY** banner at startup and keeping the capillary and gas in the status hint at all times. Glance at the banner before capturing; if it is wrong, correct it with `cap` / `gas` first.
+**Staleness is the failure mode to guard against.** Nothing checks the values against reality — `cap down 500 100` while a 50 µm is installed will confidently mislabel every shot. The driver defends against this by printing a **RUN IDENTITY** banner at startup and keeping both capillaries and the gas in the status hint at all times. Glance at the banner before capturing; if it is wrong, correct it with `cap` / `gas` first.
 
 **Upstream pressure is handled the other way** — it is read live from the Keller and snapshotted at the fire instant, so it is always correct and needs no setting. The snapshot is a short median of the most recent samples (`FIRE_SNAPSHOT_N`), which sits on the true level between the sensor's quantisation steps and ignores one-off spikes, without the lag a running mean would add over the reservoir's slow drift.
 
@@ -116,7 +121,7 @@ The stream rate is probed at the first capture: a ladder of rates is tried faste
 
 Written to a `logs/` folder.
 
-### `pvd-sensor_<timestamp>.csv` — one per session
+### `pvd-log_<timestamp>.csv` — one per session
 
 The logger flushes on a fixed cadence but writes **one row per raw Keller sample** buffered since the last flush, so no upstream sample is dropped (the file therefore has roughly `KELLER_POLL_HZ × session-seconds` rows). Pulse events are embedded on the last row of the flush in which they occurred; because each pulse also carries its own microsecond timestamp, which row it lands on doesn't affect analysis.
 
@@ -133,8 +138,10 @@ The logger flushes on a fixed cadence but writes **one row per raw Keller sample
 | `pulse_timestamps_us` | Semicolon-separated microsecond timestamps of any pulses in this interval (blank if none) |
 | `pulse_open_times_us` | Semicolon-separated open times for those pulses |
 | `pulse_acks` | Semicolon-separated ACK flags (1 = ZC1 acknowledged, 0 = no response) |
-| `capillary_id_um` | Capillary bore (µm) in force for this row |
-| `capillary_length_mm` | Capillary length (mm) in force for this row |
+| `downstream_cap_id_um` | Downstream capillary bore (µm) in force for this row |
+| `downstream_cap_length_mm` | Downstream capillary length (mm) in force for this row |
+| `upstream_cap_id_um` | Upstream capillary bore (µm), 0 if none fitted |
+| `upstream_cap_length_mm` | Upstream capillary length (mm), 0 if none fitted |
 | `gas_species` | Gas at the valve (recorded only; gauge still reads N₂-equivalent) |
 
 Rows with no pulse in their interval leave the three `pulse_*` columns blank, so filtering to pulse rows is simply a matter of selecting rows where `pulse_timestamps_us` is non-empty. The three identity columns are stamped on every row, so a mid-session `cap` / `gas` change is visible as the exact row where the values switch.
@@ -152,7 +159,8 @@ A commented header of derived values, then the decimated trace with `t = 0` at t
 | `open_time_us`, `zc1_ack` | Valve setting, and whether the ZC1 acknowledged the shot |
 | `capture_group_id` | Shared id for all shots of one `c n` run; ties the files together |
 | `capture_shot_index`, `capture_group_size` | This shot's position in the run, and the run's size |
-| `capillary_id_um`, `capillary_length_mm` | Capillary geometry that produced the shot |
+| `downstream_cap_id_um`, `downstream_cap_length_mm` | Downstream capillary geometry that produced the shot |
+| `upstream_cap_id_um`, `upstream_cap_length_mm` | Upstream capillary geometry (0 = none fitted) |
 | `gas_species` | Gas at the valve (recorded only; not applied to the gauge conversion) |
 | `upstream_bar_at_fire` | Upstream pressure at the fire instant (short median of recent samples) |
 | `upstream_degC_at_fire` | Upstream temperature at the fire instant (short median of recent samples) |
@@ -168,6 +176,24 @@ A commented header of derived values, then the decimated trace with `t = 0` at t
 | `samples_missed` | Stream samples dropped (should be 0) |
 
 The identity and upstream fields are written for **every** outcome — including non-detections and flat-trace captures — so even a dud shot records what it was trying to do. Because the volume used is also recorded, any capture can be re-analysed with a better volume estimate later without retaking data.
+
+### `pvd-captures_<timestamp>.csv` — one per session
+
+A **manifest**: one summary row per shot, for every capture taken in the session — single shots and multi-shot runs alike, at any rate. It carries the same scalar fields as the per-capture headers above (peak, Δp, τ, S_eff, Q, detection statistics, run identity), plus a `trace_file` column pointing back to that shot's full trace.
+
+Its purpose is comparison across shots. The scalars are what shot-to-shot scatter, τ-versus-bore and dose-versus-open-time work actually need, and gathering them here means one file to open rather than one per shot with a header to parse each time:
+
+```python
+import pandas as pd
+df = pd.read_csv("logs/pvd-captures_20260810_152223.csv")
+df[df.detected == 1].groupby("open_time_us").peak_mbar.agg(["mean", "std", "count"])
+```
+
+Its timestamp matches the session log's, so `pvd-log_<ts>.csv` and `pvd-captures_<ts>.csv` are an obvious pair. Rows are appended as each shot completes, so the file is usable mid-run and survives an interrupted session.
+
+Every shot is recorded, including non-detections (where `dp_upper_bound_mbar` carries the upper bound instead of a peak) and flat-trace faults (`flat_trace = 1`), so the manifest is a complete account of the session rather than only its successes. The column set is fixed and the three outcome types write blanks for fields that don't apply, so every row aligns.
+
+**Traces stay where they are.** The manifest holds scalars only; the dense time series remain in their own per-shot `pulse_*.csv` files. The two have genuinely different shapes — one row per shot versus a few thousand rows per shot — and merging them would swamp the summary that makes the manifest useful, so the manifest indexes the traces rather than absorbing them.
 
 ---
 
@@ -189,6 +215,20 @@ Two further cautions with a limiter fitted. First, Q_pulse then characterises th
 **r²** — how well a single exponential describes the fitted region. An exponential is a straight line on a log axis, so r² is measuring straightness. Values below ~0.98 suggest more than one process is acting — which is expected for a limiter (fast + slow), and is the cue to use the two-timescale fit rather than a single τ.
 
 **Sustained rate.** For continuous pulsing at rate f, the steady-state mean elevation above baseline is `p = Q_pulse × f / S_eff`, useful for finding the rate at which a chamber-pressure limit is reached. With a limiter there is a second, often tighter limit: **pulse pile-up.** Fire faster than about 1/5τ and one pulse's tail has not cleared before the next fires, so shots overlap and can no longer be resolved. With τ of a few seconds this caps clean single-shot work well below the mean-pressure limit.
+
+---
+
+## Historic data (files written before August 2026)
+
+The output schema changed on 2026-08-11. Older files differ in four ways: the session log was named `pvd-sensor_<ts>.csv` rather than `pvd-log_<ts>.csv`, the capillary columns were `capillary_id_um` / `capillary_length_mm` rather than `downstream_cap_*`, no upstream capillary was recorded at all, and no capture manifest was written.
+
+**Raw log files are never edited.** A `pvd-log_*.csv` or `pulse_*.csv` is an acquisition record — what the instrument wrote, when it wrote it. Editing one after the fact erases the distinction between what was measured at the time and what was inferred later, and any mistake in the edit is silent.
+
+Reading older files:
+
+- **`capillary_*` and `downstream_cap_*` are the same quantity**, renamed. Map the column name when reading; the values are directly comparable across the change.
+- **The upstream capillary is unknown** for anything written before the change — it was not recorded, so treat it as unknown rather than assuming none was fitted.
+- **The downstream value is only as good as the session's discipline.** It reflects whatever `cap` was last set to, which may be the startup default rather than what was actually installed. Where it matters, check it against the lab notebook rather than trusting the column outright.
 
 ---
 
@@ -242,9 +282,11 @@ CHAMBER_VOLUME_L    = 15.586    # chamber volume, for S_eff and Q_pulse
 CHAMBER_LIMIT_MBAR  = 1.0e-6    # limit being demonstrated against
 
 # ── Run identity (seeds the live cap / gas settings at startup) ──
-DEFAULT_CAPILLARY_ID_UM  = 50.0    # capillary bore (µm)
-DEFAULT_CAPILLARY_LEN_MM = 100.0   # capillary length (mm)
-DEFAULT_GAS_SPECIES      = "N2"    # gas at the valve (recorded only)
+DEFAULT_DOWNSTREAM_CAP_ID_UM  = 50.0    # downstream capillary bore (µm)
+DEFAULT_DOWNSTREAM_CAP_LEN_MM = 100.0   # downstream capillary length (mm)
+DEFAULT_UPSTREAM_CAP_ID_UM    = 0.0     # 0 = no upstream capillary fitted
+DEFAULT_UPSTREAM_CAP_LEN_MM   = 0.0     # 0 = no upstream capillary fitted
+DEFAULT_GAS_SPECIES           = "N2"    # gas at the valve (recorded only)
 ```
 
 `CHAMBER_VOLUME_L` should be set from CAD before quoting S_eff or Q_pulse. The run-identity defaults are only a starting point — change the installed capillary and gas at runtime with `cap` / `gas` rather than editing and relaunching.

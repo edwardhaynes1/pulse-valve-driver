@@ -34,15 +34,24 @@ Logging cadence
 
 Driver commands
 ---------------
-  v          fire one pulse (no capture)
-  c [n]      capture n pulses at high rate, with a summary after a multi-shot run
-  t <µs>     set open time
-  q          quit
+  v                       fire one pulse (no capture)
+  c [n]                   capture n pulses at high rate, with a summary after a run
+  t <µs>                  set open time
+  cap <up|down> <id> <len>  record a capillary (bore µm, length mm)
+  cap up none             record that no upstream capillary is fitted
+  gas <species>           record the gas at the valve
+  q                       quit
 
 Capture outputs
 ---------------
-  logs/pulse_<ts>.csv   one file per shot: full decimated trace, t = 0 at fire,
-                        with peak / dp / integral / tau / S_eff / Q in the header
+  logs/pulse_<ts>.csv        one file per shot: full decimated trace, t = 0 at
+                             fire, with peak / dp / integral / tau / S_eff / Q
+                             in the header
+  logs/pvd-captures_<ts>.csv one row per shot for the whole session — a manifest
+                             indexing every capture (single or multi-shot, any
+                             rate), so scatter / tau / regression work needs one
+                             file, not dozens. Each row's trace_file points back
+                             to its full per-shot trace.
 
 Usage
 -----
@@ -142,8 +151,8 @@ CHAMBER_VOLUME_L    = 15.586   # geometric estimate (5 combined cylinders); cons
 CHAMBER_LIMIT_MBAR  = 1.0e-6   # the in-chamber limit being demonstrated against
 
 # ─── Run identity (what physically produced these captures) ────────────────────
-# The conductance limiter and the gas are NOT auto-detectable — they change only
-# when hardware is swapped, and nothing in the rig reports them. They are stamped
+# The capillaries and the gas are NOT auto-detectable — they change only when
+# hardware is swapped, and nothing in the rig reports them. They are stamped
 # into every capture header and every session row so a file is self-describing
 # and re-analysable without the lab notebook. The catch: a stale value here is
 # WORSE than none, because it mislabels data confidently. Defences: the driver
@@ -151,10 +160,21 @@ CHAMBER_LIMIT_MBAR  = 1.0e-6   # the in-chamber limit being demonstrated against
 # times, and lets it be changed at runtime (cap / gas commands) so a mid-session
 # swap can be recorded without editing this file and relaunching.
 #
-# Upstream pressure is deliberately NOT here: it is read live from the Keller and
-# stamped at the fire instant, so it can never go stale.
-DEFAULT_CAPILLARY_ID_UM  = 50.0    # limiter bore, micrometres
-DEFAULT_CAPILLARY_LEN_MM = 100.0   # limiter length, millimetres
+# Two capillaries are recorded independently:
+#   downstream — the conductance limiter after the valve, into the chamber. This
+#                is the one that sets chamber conductance and shapes the decay.
+#                The Gyger is never run without a capillary, so this is always
+#                fitted and both values must be positive.
+#   upstream   — the feed capillary before the valve, on the reservoir side.
+#                0 records "none fitted" and is displayed as such.
+#
+# Upstream *pressure* is deliberately NOT here: it is read live from the Keller
+# and stamped at the fire instant, so it can never go stale. (Distinct from the
+# upstream capillary geometry above, which is a fixed hardware fact.)
+DEFAULT_DOWNSTREAM_CAP_ID_UM  = 50.0    # downstream limiter bore, micrometres
+DEFAULT_DOWNSTREAM_CAP_LEN_MM = 100.0   # downstream limiter length, millimetres
+DEFAULT_UPSTREAM_CAP_ID_UM    = 0.0     # 0 = no upstream capillary fitted
+DEFAULT_UPSTREAM_CAP_LEN_MM   = 0.0     # 0 = no upstream capillary fitted
 DEFAULT_GAS_SPECIES      = "N2"    # gas at the valve. RECORDED ONLY — the gauge conversion
                                    # still assumes N2/air; apply the species factor
                                    # (H2~2.4, He~5.9, Ar~0.8) downstream, not here.
@@ -184,17 +204,79 @@ def _make_log_path():
     base = datetime.now().strftime('%Y%m%d_%H%M%S')
     for attempt in range(100):
         suffix = "" if attempt == 0 else f"_{attempt}"
-        path = os.path.join(LOG_DIR, f"pvd-sensor_{base}{suffix}.csv")
+        path = os.path.join(LOG_DIR, f"pvd-log_{base}{suffix}.csv")
         try:
             fh = open(path, 'x', newline='')
             fh.close()
             return path
         except (PermissionError, FileExistsError):
             continue
-    return f"pvd-sensor_{base}.csv"
+    return f"pvd-log_{base}.csv"
 
 
 LOG_FILE = _make_log_path()
+
+# ─── Capture manifest ─────────────────────────────────────────────────────────
+# One summary row per shot — single or multi-shot, any rate — appended to a
+# single per-session file. The bulky traces stay in their own per-shot
+# pulse_*.csv files; this manifest is the index across them, so all of a
+# session's captures sit in one table for scatter / tau / regression work
+# without opening dozens of files. `trace_file` on each row points back to the
+# full trace. The column set is FIXED (below): the detected, not-detected and
+# flat-trace cases each carry a different subset of fields, so a fixed schema
+# with blanks for the missing ones keeps every row aligned. Named to match the
+# session log's stamp so the pair is obvious: pvd-log_<ts> / pvd-captures_<ts>.
+MANIFEST_FILE = os.path.join(
+    LOG_DIR,
+    "pvd-captures_" + os.path.basename(LOG_FILE)[len("pvd-log_"):])
+
+MANIFEST_COLUMNS = [
+    'capture_group_id', 'capture_shot_index', 'capture_group_size',
+    'detected', 'flat_trace',
+    'capture_rate_hz', 'analysis_rate_hz',
+    'open_time_us', 'zc1_ack',
+    'downstream_cap_id_um', 'downstream_cap_length_mm',
+    'upstream_cap_id_um', 'upstream_cap_length_mm',
+    'gas_species',
+    'upstream_bar_at_fire', 'upstream_degC_at_fire',
+    'p_base_mbar', 'baseline_sd_mbar',
+    'peak_mbar', 'dp_mbar', 't_peak_s', 't_rise_10_90_s',
+    'peak_snr', 'detect_t_stat', 'dp_upper_bound_mbar',
+    'integral_mbar_s',
+    'tau_s', 'r2', 's_eff_l_s', 'chamber_volume_l',
+    'q_pulse_mbar_l_integral', 'q_pulse_mbar_l_v_dp',
+    'samples_missed', 'trace_file',
+]
+
+_manifest_lock = threading.Lock()   # captures are serialised on the LabJack
+                                    # thread already; this is belt-and-braces.
+
+
+def append_manifest(meta: dict, trace_path):
+    """Append one summary row for a capture to MANIFEST_FILE.
+
+    Called for every shot that produced a file (detected, not-detected, and
+    flat-trace alike), so the manifest is a complete record of the session's
+    captures — a non-detection is a real result (an upper bound), not nothing.
+    Uses the fixed MANIFEST_COLUMNS: unknown keys in *meta* are dropped and
+    missing ones written blank, so the three outcome shapes all append cleanly.
+    The header is written only when the file is first created."""
+    row = dict(meta)
+    row['trace_file'] = os.path.basename(trace_path) if trace_path else ''
+    with _manifest_lock:
+        try:
+            new = (not os.path.exists(MANIFEST_FILE)
+                   or os.path.getsize(MANIFEST_FILE) == 0)
+            with open(MANIFEST_FILE, 'a', newline='') as f:
+                w = csv.DictWriter(f, fieldnames=MANIFEST_COLUMNS,
+                                   extrasaction='ignore', restval='')
+                if new:
+                    w.writeheader()
+                w.writerow(row)
+                f.flush()
+        except Exception as e:
+            log_event(f"MANIFEST: could not append row ({e})")
+
 
 # ─── Shared state ─────────────────────────────────────────────────────────────
 _lock        = threading.Lock()        # protects _state / _events / _chart
@@ -210,8 +292,10 @@ _state       = dict(
     open_time_us                = DEFAULT_OPEN_US,
     drive_rate_hz               = DEFAULT_DRIVE_HZ,
     # Run identity — what produced the captures. Runtime-settable (cap / gas).
-    capillary_id_um             = DEFAULT_CAPILLARY_ID_UM,
-    capillary_len_mm            = DEFAULT_CAPILLARY_LEN_MM,
+    downstream_cap_id_um        = DEFAULT_DOWNSTREAM_CAP_ID_UM,
+    downstream_cap_len_mm       = DEFAULT_DOWNSTREAM_CAP_LEN_MM,
+    upstream_cap_id_um          = DEFAULT_UPSTREAM_CAP_ID_UM,
+    upstream_cap_len_mm         = DEFAULT_UPSTREAM_CAP_LEN_MM,
     gas_species                 = DEFAULT_GAS_SPECIES,
     # Pulse event log: list of (iso_timestamp, open_us, ack_ok) since last row
     pulse_events                = [],
@@ -902,26 +986,30 @@ def _fit_decay(times, mbar, p_base, floor):
     return best
 
 
-def _capillary_str():
-    """Human-readable capillary geometry, e.g. '50 µm × 100 mm'."""
-    with _lock:
-        idd = _state['capillary_id_um']
-        ln  = _state['capillary_len_mm']
-    return f"{idd:g} µm × {ln:g} mm"
+def _cap_fmt(idd, ln, compact=False):
+    """Human-readable capillary geometry, e.g. '130 µm × 100 mm', or 'none' when
+    not fitted (id or length <= 0). *compact* drops the spaces for the hint."""
+    if idd is None or ln is None or idd <= 0 or ln <= 0:
+        return "none"
+    return f"{idd:g}µm×{ln:g}mm" if compact else f"{idd:g} µm × {ln:g} mm"
 
 
 def _run_conditions(up_bar, up_degC):
-    """Fields describing what produced a capture: capillary geometry, gas, and
-    the upstream state at the fire instant. Merged into every capture header
-    (all outcomes) so a file is self-describing and comparable standalone."""
+    """Fields describing what produced a capture: both capillary geometries, gas,
+    and the upstream *pressure/temperature* at the fire instant. Merged into every
+    capture header (all outcomes) so a file is self-describing and comparable
+    standalone. An unfitted upstream capillary is recorded as 0 (its 'none'
+    state), so the column is always present and machine-readable."""
     with _lock:
-        idd = _state['capillary_id_um']
-        ln  = _state['capillary_len_mm']
-        gas = _state['gas_species']
+        d_id = _state['downstream_cap_id_um']; d_ln = _state['downstream_cap_len_mm']
+        u_id = _state['upstream_cap_id_um'];   u_ln = _state['upstream_cap_len_mm']
+        gas  = _state['gas_species']
     return {
-        'capillary_id_um':       f"{idd:g}",
-        'capillary_length_mm':   f"{ln:g}",
-        'gas_species':           gas,
+        'downstream_cap_id_um':     f"{d_id:g}",
+        'downstream_cap_length_mm': f"{d_ln:g}",
+        'upstream_cap_id_um':       f"{u_id:g}",
+        'upstream_cap_length_mm':   f"{u_ln:g}",
+        'gas_species':              gas,
         'upstream_bar_at_fire':  f"{up_bar:.4f}"  if up_bar  is not None else '',
         'upstream_degC_at_fire': f"{up_degC:.2f}" if up_degC is not None else '',
     }
@@ -1073,13 +1161,14 @@ def _run_capture(lj, shot_index=1, group_id=None, group_size=1):
                   f"({v_lo:.4f} to {v_hi:.4f} V across the whole window)")
         log_event(f"CAPTURE{tag}: check the FIO2 wiring and the gauge - "
                   f"no analysis attempted")
-        _write_capture_csv(times, mbar, {'detected': 0, 'flat_trace': 1,
-                                         'capture_rate_hz': rate,
-                                         'open_time_us': open_us,
-                                         'zc1_ack': int(bool(fire_ok)),
-                                         **grp,
-                                         **_run_conditions(up_bar, up_degC)},
-                           stem=stem)
+        flat_meta = {'detected': 0, 'flat_trace': 1,
+                     'capture_rate_hz': rate,
+                     'open_time_us': open_us,
+                     'zc1_ack': int(bool(fire_ok)),
+                     **grp,
+                     **_run_conditions(up_bar, up_degC)}
+        path = _write_capture_csv(times, mbar, flat_meta, stem=stem)
+        append_manifest(flat_meta, path)
         return None
 
     if not detected:
@@ -1115,6 +1204,7 @@ def _run_capture(lj, shot_index=1, group_id=None, group_size=1):
             'samples_missed': missed,
         }
         path = _write_capture_csv(times, mbar, meta, stem=stem)
+        append_manifest(meta, path)
         log_event(f"CAPTURE{tag}: {os.path.basename(path)}")
         _capture_runs.append(dict(meta, path=path, peak=None, tau=None,
                                   detected=False))
@@ -1179,6 +1269,7 @@ def _run_capture(lj, shot_index=1, group_id=None, group_size=1):
         'samples_missed': missed,
     }
     path = _write_capture_csv(times, mbar, meta, stem=stem)
+    append_manifest(meta, path)
     log_event(f"CAPTURE{tag}: {os.path.basename(path)}")
 
     run = dict(meta)
@@ -1301,7 +1392,7 @@ def valve_drive_thread():
 # ═══════════════════════════════════════════════════════════════════════════════
 # CSV LOGGING THREAD  — drift-free 0.5 s cadence, immediate first row
 #
-# One output file per session: pvd-sensor_<ts>.csv
+# One output file per session: pvd-log_<ts>.csv
 #
 # The logger flushes on a fixed cadence, but writes one row per raw Keller
 # sample buffered since the last flush, so no upstream sample is dropped. Pulse
@@ -1313,7 +1404,8 @@ def valve_drive_thread():
 #   timestamp, keller_pressure_bar (raw), keller_temperature_degC (raw),
 #   n_keller_samples, vacuum_chamber_mbar, pulses_interval, pulses_total,
 #   open_time_us, pulse_timestamps_us, pulse_open_times_us, pulse_acks,
-#   capillary_id_um, capillary_length_mm, gas_species
+#   downstream_cap_id_um, downstream_cap_length_mm,
+#   upstream_cap_id_um, upstream_cap_length_mm, gas_species
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def logger_thread():
@@ -1335,9 +1427,11 @@ def logger_thread():
             'pulse_timestamps_us',     # semicolon-separated microsecond timestamps
             'pulse_open_times_us',     # semicolon-separated open times
             'pulse_acks',              # semicolon-separated 1/0 ack flags
-            'capillary_id_um',         # limiter bore in force for this row
-            'capillary_length_mm',     # limiter length in force for this row
-            'gas_species',             # gas in force for this row
+            'downstream_cap_id_um',     # downstream limiter bore in force for this row
+            'downstream_cap_length_mm', # downstream limiter length in force for this row
+            'upstream_cap_id_um',       # upstream capillary bore (0 = none)
+            'upstream_cap_length_mm',   # upstream capillary length (0 = none)
+            'gas_species',              # gas in force for this row
         ])
         f.flush()
 
@@ -1357,8 +1451,10 @@ def logger_thread():
                 p_int  = _state['pulse_interval']
                 p_tot  = _state['pulses_total']
                 ot     = _state['open_time_us']
-                cap_id = _state['capillary_id_um']
-                cap_ln = _state['capillary_len_mm']
+                d_id   = _state['downstream_cap_id_um']
+                d_ln   = _state['downstream_cap_len_mm']
+                u_id   = _state['upstream_cap_id_um']
+                u_ln   = _state['upstream_cap_len_mm']
                 gas    = _state['gas_species']
                 _state['pulse_interval'] = 0
 
@@ -1372,7 +1468,8 @@ def logger_thread():
             else:
                 pulse_ts = pulse_ots = pulse_acks = ''
 
-            cap_s, ln_s = f"{cap_id:g}", f"{cap_ln:g}"
+            d_id_s, d_ln_s = f"{d_id:g}", f"{d_ln:g}"
+            u_id_s, u_ln_s = f"{u_id:g}", f"{u_ln:g}"
 
             def _row(ts, p, t, n_k, with_pulses):
                 # Pulses carry their own µs timestamps, so attaching the interval's
@@ -1383,7 +1480,7 @@ def logger_thread():
                     (pulse_ts   if with_pulses else ''),
                     (pulse_ots  if with_pulses else ''),
                     (pulse_acks if with_pulses else ''),
-                    cap_s, ln_s, gas,
+                    d_id_s, d_ln_s, u_id_s, u_ln_s, gas,
                 ]
 
             if pending:
@@ -1539,7 +1636,8 @@ class PVDGui:
         self._driver_print("  v              fire one pulse (no capture)")
         self._driver_print("  c [n]          capture n pulses at high rate")
         self._driver_print("  t <µs>         set open time")
-        self._driver_print("  cap <id> <len>  set capillary (bore µm, length mm)")
+        self._driver_print("  cap <up|down> <id> <len>  set a capillary (bore µm, length mm)")
+        self._driver_print("  cap up none    record that no upstream capillary is fitted")
         self._driver_print("  gas <species>  set gas (N2, H2, He, Ar…)")
         self._driver_print("  q              quit")
         self._driver_print("")
@@ -1552,12 +1650,15 @@ class PVDGui:
         swapped and this is wrong, it is impossible to miss. Correct it with the
         cap / gas commands before capturing."""
         with _lock:
-            gas = _state['gas_species']
+            d_id = _state['downstream_cap_id_um']; d_ln = _state['downstream_cap_len_mm']
+            u_id = _state['upstream_cap_id_um'];   u_ln = _state['upstream_cap_len_mm']
+            gas  = _state['gas_species']
         self._driver_print("  ┄┄┄ RUN IDENTITY — check before capturing ┄┄┄", "ok")
-        self._driver_print(f"    capillary: {_capillary_str()}", "ok")
-        self._driver_print(f"    gas:       {gas}", "ok")
-        self._driver_print("    upstream:  read live from the Keller, stamped at fire", "dim")
-        self._driver_print("    wrong?  cap <id_µm> <len_mm>   /   gas <species>", "dim")
+        self._driver_print(f"    downstream cap: {_cap_fmt(d_id, d_ln)}", "ok")
+        self._driver_print(f"    upstream cap:   {_cap_fmt(u_id, u_ln)}", "ok")
+        self._driver_print(f"    gas:            {gas}", "ok")
+        self._driver_print("    upstream P:     read live from the Keller, stamped at fire", "dim")
+        self._driver_print("    wrong?  cap <up|down> <id_µm> <len_mm>   /   gas <species>", "dim")
         self._driver_print("  ┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄┄", "ok")
 
     def _driver_print(self, line, tag=None):
@@ -1571,12 +1672,12 @@ class PVDGui:
 
     def _update_hint(self):
         with _lock:
-            ot  = _state['open_time_us']
-            idd = _state['capillary_id_um']
-            ln  = _state['capillary_len_mm']
-            gas = _state['gas_species']
-        cap = f"{idd:g}µm×{ln:g}mm"
-        ident = f"{cap} · {gas}"
+            ot   = _state['open_time_us']
+            d_id = _state['downstream_cap_id_um']; d_ln = _state['downstream_cap_len_mm']
+            u_id = _state['upstream_cap_id_um'];   u_ln = _state['upstream_cap_len_mm']
+            gas  = _state['gas_species']
+        ident = (f"D:{_cap_fmt(d_id, d_ln, compact=True)} "
+                 f"U:{_cap_fmt(u_id, u_ln, compact=True)} · {gas}")
         if _capture_busy:
             self.hint_var.set(f"{ident}  |  open={ot} µs  |  CAPTURING…")
         elif _capture_pending > 0:
@@ -1644,11 +1745,17 @@ class PVDGui:
                 self._driver_print("  usage: t <µs>  (50 – 5 000 000)")
 
         elif cmd == "cap":
-            # cap <id_µm> <len_mm>
-            if len(parts) == 3:
-                self._set_capillary(parts[1], parts[2])
+            # cap <up|down> <id_µm> <len_mm>   |   cap up none
+            UP   = ("up", "u", "upstream")
+            DOWN = ("down", "d", "downstream")
+            if len(parts) == 3 and parts[1] in UP and parts[2] == "none":
+                self._clear_upstream_cap()
+            elif len(parts) == 4 and parts[1] in (UP + DOWN):
+                side = "up" if parts[1] in UP else "down"
+                self._set_capillary(side, parts[2], parts[3])
             else:
-                self._driver_print("  usage: cap <id_µm> <len_mm>", "err")
+                self._driver_print(
+                    "  usage: cap <up|down> <id_µm> <len_mm>   |   cap up none", "err")
 
         elif cmd == "gas":
             if len(raw_parts) == 2:
@@ -1691,10 +1798,12 @@ class PVDGui:
         log_event(f"open time  →  {new_val} µs{suffix}")
         self._update_hint()
 
-    def _set_capillary(self, id_um, len_mm):
-        """Record the capillary now installed. Stamped into every subsequent
-        capture and session row. The rig always has a capillary after the
-        valve, so both values must be positive."""
+    def _set_capillary(self, side, id_um, len_mm):
+        """Record a capillary now installed on *side* ('up' or 'down'). Stamped
+        into every subsequent capture and session row. Both values must be
+        positive; to record that no upstream capillary is fitted use
+        'cap up none' instead. The downstream capillary cannot be cleared — the
+        Gyger is never run without one."""
         try:
             idd = float(id_um)
             ln  = float(len_mm)
@@ -1702,14 +1811,30 @@ class PVDGui:
             self._driver_print("  invalid — id and length must be numbers", "err")
             return
         if idd <= 0 or ln <= 0:
-            self._driver_print("  invalid — id and length must be > 0", "err")
+            self._driver_print(
+                "  invalid — id and length must be > 0 "
+                "(use 'cap up none' to clear the upstream capillary)", "err")
             return
+        id_key = 'upstream_cap_id_um'  if side == "up" else 'downstream_cap_id_um'
+        ln_key = 'upstream_cap_len_mm' if side == "up" else 'downstream_cap_len_mm'
+        label  = "upstream" if side == "up" else "downstream"
         with _lock:
-            _state['capillary_id_um']  = idd
-            _state['capillary_len_mm'] = ln
-        desc = _capillary_str()
-        self._driver_print(f"  capillary → {desc}", "ok")
-        log_event(f"capillary  →  {desc}")
+            _state[id_key] = idd
+            _state[ln_key] = ln
+        desc = _cap_fmt(idd, ln)
+        self._driver_print(f"  {label} capillary → {desc}", "ok")
+        log_event(f"{label} capillary  →  {desc}")
+        self._update_hint()
+
+    def _clear_upstream_cap(self):
+        """Record that no upstream capillary is fitted (both values → 0). Only
+        the upstream side can be cleared; the downstream capillary is always
+        present on this rig."""
+        with _lock:
+            _state['upstream_cap_id_um']  = 0.0
+            _state['upstream_cap_len_mm'] = 0.0
+        self._driver_print("  upstream capillary → none", "ok")
+        log_event("upstream capillary  →  none")
         self._update_hint()
 
     def _set_gas(self, species):
@@ -1910,6 +2035,7 @@ def main():
         print("  [ZC1]    NOT FOUND — supervisor will keep scanning.")
 
     print(f"\nLogging to: {LOG_FILE}")
+    print(f"Capture manifest: {MANIFEST_FILE}")
     print(f"Log cadence: every {LOG_INTERVAL_S:g} s (drift-free)")
     print("─" * 50)
 
