@@ -137,7 +137,7 @@ LOG_DIR            = str(Path(__file__).parent / "logs")
 # a configuration it cannot meet by erroring on every packet rather than by
 # refusing outright. So the rate is probed at the first capture: the ladder is
 # tried fastest-first and the first clean rate is cached for the session.
-CAPTURE_RATE_LADDER = (5000, 2500, 2000, 1000, 500)   # Hz, fastest first
+CAPTURE_RATE_LADDER = (2500, 2000, 1000, 500)   # Hz, fastest first
 CAPTURE_RESOLUTION  = 0        # U3 stream resolution index (0 = best noise)
 CAPTURE_PRE_S       = 1.0      # baseline recorded before the pulse (s)
 CAPTURE_POST_S      = 5.0      # transient + tail recorded after the pulse (s)
