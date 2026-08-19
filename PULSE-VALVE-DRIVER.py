@@ -137,7 +137,7 @@ LOG_DIR            = str(Path(__file__).parent / "logs")
 # a configuration it cannot meet by erroring on every packet rather than by
 # refusing outright. So the rate is probed at the first capture: the ladder is
 # tried fastest-first and the first clean rate is cached for the session.
-CAPTURE_RATE_LADDER = (2000, 1000, 500)   # Hz, fastest first
+CAPTURE_RATE_LADDER = (5000, 2500, 2000, 1000, 500)   # Hz, fastest first
 CAPTURE_RESOLUTION  = 0        # U3 stream resolution index (0 = best noise)
 CAPTURE_PRE_S       = 1.0      # baseline recorded before the pulse (s)
 CAPTURE_POST_S      = 5.0      # transient + tail recorded after the pulse (s)
@@ -1925,6 +1925,22 @@ class PVDGui:
 
     # ── polling loop ────────────────────────────────────────────────────────
     def _poll(self):
+        """GUI refresh tick. Reschedules itself unconditionally.
+
+        _poll_once does the drawing. It is wrapped because this callback is the
+        only thing that keeps the GUI alive: if it raises, Tk drops the chain
+        and the window stops updating for good, which looks exactly like a
+        freeze even though the acquisition threads are still running. A drawing
+        fault should cost one frame, not the whole session.
+        """
+        try:
+            self._poll_once()
+        except Exception as e:
+            log_event(f"GUI refresh error (continuing): {e}")
+        if not _stop.is_set():
+            self.root.after(150, self._poll)
+
+    def _poll_once(self):
         with _lock:
             p_samp = _state['keller_pressure_samples']
             t_samp = _state['keller_temperature_samples']
@@ -1982,10 +1998,16 @@ class PVDGui:
         elif _capture_runs:
             last = _capture_runs[-1]
             pk = last['peak']
-            pct = 100.0 * pk / CHAMBER_LIMIT_MBAR
-            st.insert("end",
-                      f"last peak {pk:.3e} mbar  ({pct:.0f}% of limit)\n",
-                      "err" if pk >= CHAMBER_LIMIT_MBAR else "bright")
+            # A shot with no detectable pulse records peak = None. Formatting it
+            # as a number raises, and because _poll reschedules itself at the
+            # end, the exception stops the GUI updating for good.
+            if pk is None:
+                st.insert("end", "last shot — no pulse detected\n", "err")
+            else:
+                pct = 100.0 * pk / CHAMBER_LIMIT_MBAR
+                st.insert("end",
+                          f"last peak {pk:.3e} mbar  ({pct:.0f}% of limit)\n",
+                          "err" if pk >= CHAMBER_LIMIT_MBAR else "bright")
         else:
             st.insert("end", "none yet\n", "dim")
         st.configure(state="disabled")
@@ -2004,9 +2026,6 @@ class PVDGui:
             self.logtext.configure(state="disabled")
 
         self._update_hint()
-
-        if not _stop.is_set():
-            self.root.after(150, self._poll)
 
     # ── lifecycle ───────────────────────────────────────────────────────────
     def shutdown(self):
