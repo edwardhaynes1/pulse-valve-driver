@@ -137,7 +137,7 @@ LOG_DIR            = str(Path(__file__).parent / "logs")
 # a configuration it cannot meet by erroring on every packet rather than by
 # refusing outright. So the rate is probed at the first capture: the ladder is
 # tried fastest-first and the first clean rate is cached for the session.
-CAPTURE_RATE_LADDER = (2500, 2000, 1000, 500)   # Hz, fastest first
+CAPTURE_RATE_LADDER = (2000, 1000, 500)   # Hz, fastest first
 CAPTURE_RESOLUTION  = 0        # U3 stream resolution index (0 = best noise)
 CAPTURE_PRE_S       = 1.0      # baseline recorded before the pulse (s)
 CAPTURE_POST_S      = 5.0      # transient + tail recorded after the pulse (s)
@@ -471,6 +471,18 @@ def labjack_thread():
         # ── connect / configure ────────────────────────────────────────────
         try:
             lj = u3.U3()
+            # A capture that died before streamStop() leaves the stream running
+            # in the U3 itself, and that state outlives our process. Every later
+            # AIN() then fails with STREAM_IS_ACTIVE (48), which this thread
+            # reads as a disconnect — so it reconnects, fails again, and spins.
+            # Relaunching the app cannot fix it because the state is in the
+            # device. Clear it defensively on every connect; the exception is
+            # the normal case, when nothing was streaming.
+            try:
+                lj.streamStop()
+                log_event("LabJack: cleared a stale stream left by an earlier capture")
+            except Exception:
+                pass
             lj.getCalibrationData()
             lj.configIO(FIOAnalog=0x04)   # FIO2 as analogue input (vacuum gauge)
             _labjack_ok = True
@@ -535,6 +547,12 @@ def labjack_thread():
                 pass
             if not _stop.is_set():
                 log_event("LabJack disconnected — attempting reconnect")
+                # Without a pause this loop reconnects, fails, and logs again
+                # within milliseconds — hundreds of identical lines a second,
+                # which floods the event log and starves the GUI. A short wait
+                # costs nothing on a transient fault and keeps the app usable
+                # on a persistent one.
+                _stop.wait(timeout=2.0)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
