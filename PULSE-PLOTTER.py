@@ -34,6 +34,16 @@ middle value.
 Everything is recomputed from the raw trace, so the chamber volume can be
 changed after the fact without retaking any data.
 
+Capture time
+------------
+Each plot and each console report states when the capture was taken, as
+DD/MM/YY HH:MM:SS. A set of shots shows the span from first to last, so a run
+spread over an hour is visibly distinct from ten shots in one minute. The time
+comes from the filename stamp written by the driver at the moment of firing;
+for renamed files it falls back to capture_group_id in the header, and only as
+a last resort to the file's modification time, which copying or editing can
+change.
+
 Run identity
 ------------
 Under each plot title is a caption naming what produced the shot: the
@@ -122,6 +132,8 @@ import glob
 import math
 import argparse
 import csv
+import re
+from datetime import datetime
 
 import matplotlib
 import matplotlib.pyplot as plt
@@ -242,6 +254,53 @@ def expand_paths(args_paths):
 # ═══════════════════════════════════════════════════════════════════════════
 # FILE INPUT
 # ═══════════════════════════════════════════════════════════════════════════
+
+_STAMP_RE = re.compile(r"(\d{8})_(\d{6})")
+
+
+def capture_started(path, meta):
+    """When the capture was taken, as a datetime, or None if it can't be told.
+
+    Three sources, in order of trust:
+      1. the filename stamp, pulse_YYYYmmdd_HHMMSS[_sNN].csv — written by the
+         driver at the moment of firing, so it is the acquisition time itself;
+      2. capture_group_id in the header, same stamp, for files that have been
+         renamed;
+      3. the file's modification time, which is only a fallback — copying or
+         editing a file changes it, so it can be much later than the capture.
+    """
+    m = _STAMP_RE.search(os.path.basename(path))
+    if not m:
+        m = _STAMP_RE.search(str(meta.get("capture_group_id", "")))
+    if m:
+        try:
+            return datetime.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S")
+        except ValueError:
+            pass
+    try:
+        return datetime.fromtimestamp(os.path.getmtime(path))
+    except OSError:
+        return None
+
+
+def capture_time_str(records, with_date=True):
+    """One line describing when a set of captures was taken.
+
+    A single shot gives a point in time; several give the span, so that a run
+    spread over an hour is visibly different from ten shots in one minute.
+    Dates are DD/MM/YY. Returns '' when no record carries a usable time.
+    """
+    times = sorted(r["started"] for r in records if r.get("started"))
+    if not times:
+        return ""
+    first, last = times[0], times[-1]
+    d = first.strftime("%d/%m/%y ") if with_date else ""
+    if first == last:
+        return f"{d}{first:%H:%M:%S}"
+    if first.date() == last.date():
+        return f"{d}{first:%H:%M:%S}–{last:%H:%M:%S}"
+    return f"{first:%d/%m/%y %H:%M:%S} – {last:%d/%m/%y %H:%M:%S}"
+
 
 def read_capture(path):
     """Return (meta dict, times list, mbar list)."""
@@ -475,6 +534,7 @@ def load_one(path, args):
     return dict(path=path, name=os.path.basename(path), meta=meta,
                 times=times, mbar=mbar, base_fn=base_fn, sd=bl["_sd"],
                 bl=bl, a=a, volume=volume, detected=detected,
+                started=capture_started(path, meta),
                 open_us=meta.get("open_time_us", "?"))
 
 
@@ -802,9 +862,11 @@ def plot_single(ax, r, xlim, limit, title_extra=""):
     ax.grid(True, alpha=0.25)
     for sp in ("top", "right"):
         ax.spines[sp].set_visible(False)
+    _when = capture_time_str([r])
     ax.set_title(f"Gyger pulse — open {r['open_us']} µs — "
                  f"captured at {r['meta'].get('capture_rate_hz','?')} Hz"
-                 f"{title_extra}\n{run_identity_str(r['meta'])}",
+                 f"{title_extra}\n{run_identity_str(r['meta'])}"
+                 + (f"\n{_when}" if _when else ""),
                  fontsize=12, loc="left")
     ax.legend(loc="upper right", fontsize=9, framealpha=0.9)
 
@@ -940,8 +1002,10 @@ def plot_overlay(ax, groups, stats, xlim, limit, use_excess,
         ax.spines[sp].set_visible(False)
     n_all = sum(len(r) for _, r in groups)
     _ident = run_identity_for_records([r for _, recs in groups for r in recs])
+    _when = capture_time_str([r for _, recs in groups for r in recs])
     ax.set_title(f"Gyger pulse captures — {n_all} shots in "
-                 f"{len(groups)} open-time groups{title_extra}\n{_ident}",
+                 f"{len(groups)} open-time groups{title_extra}\n{_ident}"
+                 + (f"\n{_when}" if _when else ""),
                  fontsize=12, loc="left")
     ax.legend(loc="upper right", fontsize=9, framealpha=0.9)
 
@@ -1096,8 +1160,10 @@ def plot_logabs(ax, groups, stats, xlim, limit, title_extra=""):
         ax.spines[sp].set_visible(False)
     n_all = sum(len(r) for _, r in groups)
     _ident = run_identity_for_records([r for _, recs in groups for r in recs])
+    _when = capture_time_str([r for _, recs in groups for r in recs])
     ax.set_title(f"Gyger pulse — absolute pressure — "
-                 f"{n_all} shot{'' if n_all == 1 else 's'}{title_extra}\n{_ident}",
+                 f"{n_all} shot{'' if n_all == 1 else 's'}{title_extra}\n{_ident}"
+                 + (f"\n{_when}" if _when else ""),
                  fontsize=12, loc="left")
     ax.legend(loc="upper right", fontsize=9, framealpha=0.9)
 
@@ -1109,6 +1175,9 @@ def plot_logabs(ax, groups, stats, xlim, limit, title_extra=""):
 def report_single(r, args):
     a, bl, sd = r["a"], r["bl"], r["sd"]
     dt = r["times"][1] - r["times"][0]
+    _when = capture_time_str([r])
+    if _when:
+        print(f"  captured   {_when}")
     print(f"  samples    {len(r['times'])}  from {r['times'][0]:+.2f} to "
           f"{r['times'][-1]:+.2f} s ({1/dt:.0f} Hz)")
     print(f"  open time  {r['open_us']} µs")
@@ -1198,6 +1267,10 @@ def report_single(r, args):
 
 def report_groups(groups, stats, args, volume):
     print()
+    _when = capture_time_str([r for _, recs in groups for r in recs])
+    if _when:
+        print(f"Captured {_when}")
+        print()
     print(f"{'open':>7} {'n':>7} {'Δp (mbar)':>24} {'t_peak (ms)':>16} "
           f"{'rise (ms)':>16}")
     for key, recs in groups:
