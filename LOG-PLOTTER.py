@@ -26,7 +26,7 @@ Usage
 
 If no CSV file is given on the command line, a file-picker dialog opens so you
 can choose which log to plot. If the dialog can't open (e.g. no display), a
-numbered list of pvd-sensor_*.csv files in the current folder is offered
+numbered list of pvd-log_*.csv files in the current folder is offered
 instead.
 """
 
@@ -91,7 +91,8 @@ def choose_csv_file():
         root.update()
         path = filedialog.askopenfilename(
             title="Select a pulse-valve log to plot",
-            filetypes=[("PVD sensor logs", "pvd-sensor_*.csv"),
+            filetypes=[("PVD session logs", "pvd-log_*.csv"),
+                       ("PVD session logs (pre-Aug 2026)", "pvd-sensor_*.csv"),
                        ("CSV files", "*.csv"),
                        ("All files", "*.*")],
         )
@@ -104,7 +105,9 @@ def choose_csv_file():
         pass  # fall through to text-mode picker
 
     # ── text-mode fallback ─────────────────────────────────────────────────
-    candidates = sorted(glob.glob("pvd-sensor_*.csv")) or sorted(glob.glob("*.csv"))
+    candidates = (sorted(glob.glob("pvd-log_*.csv"))
+                  + sorted(glob.glob("pvd-sensor_*.csv"))   # pre-Aug 2026 name
+                  or sorted(glob.glob("*.csv")))
     if not candidates:
         print("No CSV files found in the current folder.")
         print("Pass a file explicitly:  python PULSE-VALVE-LOG-PLOTTER.py <file.csv>")
@@ -126,25 +129,54 @@ def choose_csv_file():
         print("  invalid choice")
 
 
+def _cap_fmt(idd, ln):
+    """Format one capillary, or 'none' when it is recorded as not fitted."""
+    if not idd:
+        return None                       # field absent — unknown
+    try:
+        if float(idd) <= 0:
+            return "none"
+    except ValueError:
+        pass
+    return f"{idd} µm × {ln} mm" if ln else f"{idd} µm"
+
+
 def session_identity_str(rows):
-    """One-line limiter + gas caption for a session, from the run-identity
-    columns. Shows the actual setting; if it changed mid-session (the driver
-    allows live cap/gas changes) it lists the states in the order they appeared,
-    joined by →, instead of a bare 'mixed'. Returns '' when the columns are
-    absent (logs predating the stamp) so nothing misleading is shown."""
-    if not rows or "capillary_id_um" not in rows[0]:
+    """One-line capillary + gas caption for a session.
+
+    Reads the two-capillary columns written from August 2026 onward, and falls
+    back to the single legacy `capillary_*` pair, which was the downstream
+    capillary under its old name. If the setting changed mid-session — the
+    driver allows live cap/gas changes — the states are listed in the order
+    they appeared rather than collapsed to a bare 'mixed'. Returns '' only when
+    no identity columns exist at all.
+    """
+    if not rows:
+        return ""
+    have_new = "downstream_cap_id_um" in rows[0]
+    have_old = "capillary_id_um" in rows[0]
+    if not (have_new or have_old):
         return ""
 
     def state(r):
-        idd = (r.get("capillary_id_um") or "").strip()
-        ln  = (r.get("capillary_length_mm") or "").strip()
+        if have_new:
+            d = _cap_fmt((r.get("downstream_cap_id_um") or "").strip(),
+                         (r.get("downstream_cap_length_mm") or "").strip())
+            u = _cap_fmt((r.get("upstream_cap_id_um") or "").strip(),
+                         (r.get("upstream_cap_length_mm") or "").strip())
+            if d is None and u is None:
+                return None
+            cap = f"down {d or 'n/a'}  ·  up {u or 'n/a'}"
+        else:
+            d = _cap_fmt((r.get("capillary_id_um") or "").strip(),
+                         (r.get("capillary_length_mm") or "").strip())
+            if d is None:
+                return None
+            # legacy logs recorded only the downstream capillary
+            cap = f"down {d}  ·  up n/a"
         gas = (r.get("gas_species") or "").strip()
-        if not idd:
-            return None                    # blank/old row — skip
-        cap = f"{idd} µm × {ln} mm" if ln else f"{idd} µm"
         return cap, (gas if gas else "gas n/a")
 
-    # distinct (cap, gas) states in order of first appearance
     seen, order = set(), []
     for r in rows:
         st = state(r)
@@ -158,18 +190,18 @@ def session_identity_str(rows):
         return ""
     if len(order) == 1:
         cap, gas = order[0]
-        return f"limiter {cap}    ·    gas {gas}"
+        return f"{cap}  ·  gas {gas}"
     if len(order) <= 3:
-        return "limiter/gas changed:    " + "    →    ".join(
+        return "capillary/gas changed:    " + "    →    ".join(
             f"{cap} · {gas}" for cap, gas in order)
-    return (f"limiter/gas: {len(order)} distinct settings this session "
+    return (f"capillary/gas: {len(order)} distinct settings this session "
             f"— see per-row columns")
 
 
 def main():
     ap = argparse.ArgumentParser(description="Overlay plot of a PVD session")
     ap.add_argument("csv", nargs="?", default=None,
-                    help="pvd-sensor_*.csv file (if omitted, a picker opens)")
+                    help="pvd-log_*.csv file (if omitted, a picker opens)")
     ap.add_argument("--open-time", type=int, default=None,
                     help="OPTIONAL: only plot rows where open_time_us == N "
                          "(default: plot the whole file)")
@@ -180,6 +212,13 @@ def main():
     ap.add_argument("--margin", type=float, default=30.0,
                     help="seconds of margin either side of pulses when --zoom "
                          "is used (default 30)")
+    ap.add_argument("--gauge-floor", type=float, default=1e-11, metavar="MBAR",
+                    help="rows whose vacuum reading is below this are treated "
+                         "as the gauge not yet reading and are dropped from the "
+                         "vacuum trace (default 1e-11). The chamber never sees "
+                         "1e-11, so such rows are an offline gauge, not data; "
+                         "left in, they stretch the log axis over five empty "
+                         "decades. Use 0 to keep everything.")
     ap.add_argument("--smooth", type=int, default=0, metavar="N",
                     help="moving-average window (in rows) applied at plot time "
                          "to the raw upstream traces; 0 = raw (default). The log "
@@ -210,6 +249,20 @@ def main():
         print(f"Upstream traces smoothed with a {args.smooth}-row moving average "
               f"(plot-time only; log is raw)")
     vac       = [to_float(r["vacuum_chamber_mbar"]) for r in rows]
+    if args.gauge_floor and args.gauge_floor > 0:
+        n_off = sum(1 for v in vac if v is not None and v < args.gauge_floor)
+        if n_off:
+            vac = [None if (v is not None and v < args.gauge_floor) else v
+                   for v in vac]
+            if n_off == len(vac):
+                print(f"WARNING: every vacuum reading in this log is below "
+                      f"{args.gauge_floor:g} mbar. The gauge was offline for the "
+                      f"whole session — the vacuum panel will be empty. Check the "
+                      f"gauge connection before trusting anything from this file.")
+            else:
+                print(f"Vacuum: {n_off} of {len(vac)} rows below "
+                      f"{args.gauge_floor:g} mbar treated as gauge-not-reading "
+                      f"and omitted (use --gauge-floor 0 to keep them)")
 
     # ── Extract pulse events (may be multiple per row, semicolon-sep) ──────
     pulse_times = []
@@ -225,8 +278,13 @@ def main():
                         pass
 
     t0, t1 = t[0], t[-1]
+    _dur = (t1 - t0).total_seconds()
+    _dur_s = (f"{_dur:.0f} s" if _dur < 120
+              else f"{_dur/60:.1f} min" if _dur < 7200
+              else f"{_dur/3600:.1f} h")
+    print(f"Session started: {t0.strftime('%d/%m/%y %H:%M:%S')}")
     print(f"Plotting {section}: {len(rows)} rows, "
-          f"{t0.strftime('%H:%M:%S')} → {t1.strftime('%H:%M:%S')}, "
+          f"{t0.strftime('%H:%M:%S')} → {t1.strftime('%H:%M:%S')} ({_dur_s}), "
           f"{len(pulse_times)} pulses")
 
     # ── Figure: two stacked panels sharing the x-axis ──────────────────────
@@ -235,8 +293,18 @@ def main():
         gridspec_kw={"height_ratios": [1, 1], "hspace": 0.12},
     )
     _ident = session_identity_str(rows)
+    if _ident:
+        # A mid-session change lists every state, which easily overruns the
+        # figure width. Break it at the arrows and shrink the type so the
+        # whole caption stays inside the canvas.
+        _ident = _ident.replace("    →    ", "\n   →   ")
     _sub = f"\n{_ident}" if _ident else ""
-    fig.suptitle(f"Pulse valve session — {section}{_sub}", fontsize=13, y=0.97)
+    # Start date and time, so a saved figure identifies its own session
+    # without needing the filename.
+    _sub += f"\n{t0.strftime('%d/%m/%y %H:%M:%S')} · {_dur_s}"
+    _sub_lines = _sub.count("\n")
+    fig.suptitle(f"Pulse valve session — {section}{_sub}",
+                 fontsize=13 if _sub_lines <= 1 else 10, y=0.98)
 
     # Colours
     C_P   = "#1f5fd0"   # upstream pressure  (blue)
@@ -307,7 +375,9 @@ def main():
                   fontsize=9, framealpha=0.9)
 
     # subplots_adjust rather than tight_layout — twinx axes aren't tight-safe
-    fig.subplots_adjust(left=0.08, right=0.92, top=0.93, bottom=0.08, hspace=0.12)
+    fig.subplots_adjust(left=0.08, right=0.92,
+                        top=0.93 - 0.025 * max(0, _sub_lines - 1),
+                        bottom=0.08, hspace=0.12)
 
     if args.out:
         fig.savefig(args.out, dpi=150, bbox_inches="tight")
