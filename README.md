@@ -21,7 +21,7 @@ isolation valve → **pulse valve** → conductance limiter → vacuum chamber (
 
 - Single-shot pulse valve control via ZC1 controller over RS-232/USB
 - Real-time upstream pressure and temperature logging (Keller PAA series)
-- Vacuum chamber pressure logging via LabJack U3 (log-linear gauge)
+- Vacuum chamber pressure logging via LabJack U3 (Pfeiffer IKR 270 behind a voltage divider)
 - **Pulse capture**: hardware-streamed chamber pressure through a single shot, with the valve fired automatically inside the capture window
 - Automatic analysis of each capture — peak, Δp, rise time, decay constant, effective pumping speed, gas delivered per pulse
 - **Run identity**: limiter bore/length and gas are recorded with every capture and row and can be changed live; upstream pressure and temperature are snapshotted at the fire instant
@@ -297,15 +297,18 @@ DEFAULT_GAS_SPECIES           = "N2"    # gas at the valve (recorded only)
 
 ## Vacuum gauge calibration
 
-The LabJack FIO2 input uses a log-linear conversion:
+The chamber gauge is a Pfeiffer IKR 270 cold cathode gauge, read on LabJack FIO2 through a voltage divider — the same gauge, divider and conversion as the TE-valve driver. The gauge characteristic is
 
 ```
-log10(P / mbar) = 5.389 × V − 11.329
+log10(P / mbar) = 1.25 × U_gauge − 12.75        (valid for U_gauge 1.96 … 8.6 V)
+U_gauge = 3.235 × V_LabJack                     (VACUUM_DIVIDER_RATIO)
 ```
 
-The LabJack U3 single-ended ADC saturates at ~2.44 V, corresponding to ~1 mbar. Readings above this pressure will be pegged. See `VACUUM-DIAG.py` for a standalone diagnostic.
+so `log10(P / mbar) ≈ 4.044 × V_LabJack − 12.75`. The divider ratio was calibrated at 1.713 V ↔ 1.5e-6 mbar.
 
-Gauge readings are gas-species dependent. For a Pirani/cold-cathode combination gauge the displayed value is calibrated for air/N₂; multiply by the manufacturer's factor for other species (H₂ ≈ 2.4, He ≈ 5.9, Ar ≈ 0.8). A 10⁻⁶ mbar limit in hydrogen therefore corresponds to a displayed ~4×10⁻⁷. The `gas_species` field records which gas was used, but the conversion above is **not** adjusted automatically — apply the factor when you analyse.
+FIO2 is read on the U3-LV's special 0–3.6 V range (`VACUUM_AIN_SPECIAL`), both in monitoring and in capture streaming. With the divider, the gauge's full 8.6 V maps to 2.66 V, which the normal 0–2.44 V range would clip at about 1–2e-3 mbar. See `VACUUM-DIAG.py` for a standalone diagnostic.
+
+Gauge readings are gas-species dependent. The IKR 270's displayed value is calibrated for air/N₂; multiply by the manufacturer's factor for other species (H₂ ≈ 2.4, He ≈ 5.9, Ar ≈ 0.8). A 10⁻⁶ mbar limit in hydrogen therefore corresponds to a displayed ~4×10⁻⁷. The `gas_species` field records which gas was used, but the conversion above is **not** adjusted automatically — apply the factor when you analyse.
 
 ---
 

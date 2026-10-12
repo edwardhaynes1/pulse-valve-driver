@@ -91,9 +91,24 @@ except ImportError:
 # ═══════════════════════════════════════════════════════════════════════════════
 # CONFIGURATION
 # ═══════════════════════════════════════════════════════════════════════════════
-LABJACK_FIO2_CHANNEL  = 2          # AIN2 = FIO2
-VACUUM_SLOPE          = 5.389       # log-linear calibration slope
-VACUUM_INTERCEPT      = -11.329     # log-linear calibration intercept
+# LabJack vacuum gauge (FIO2, analogue) — Pfeiffer IKR 270 cold cathode gauge
+# behind a voltage divider. Gauge characteristic (manual, Appendix A):
+#   p [mbar] = 10 ** (1.25 * U_gauge - 12.75)   valid for U_gauge 1.96 … 8.6 V
+# The LabJack sees V = U_gauge / VACUUM_DIVIDER_RATIO, so the slope per
+# LabJack volt is 1.25 × ratio. The divider does not change the intercept.
+# Same gauge, divider and conversion as the TE-valve driver.
+LABJACK_FIO2_CHANNEL  = 2          # AIN2 (analogue input 2) = FIO2
+VACUUM_DIVIDER_RATIO  = 3.235      # U_gauge / V_LabJack — calibrated 1.713 V ↔ 1.5e-6 mbar
+VACUUM_GAUGE_SLOPE    = 1.25       # decades per gauge volt (IKR 270)
+VACUUM_SLOPE          = VACUUM_GAUGE_SLOPE * VACUUM_DIVIDER_RATIO   # ≈ 4.044 decades per LabJack volt
+VACUUM_INTERCEPT      = -12.75     # log10(p / mbar) at 0 V (IKR 270, mbar)
+VACUUM_AIN_SPECIAL    = True       # read FIO2 on the U3-LV "special" 0-3.6 V range
+                                   # (negative channel 32) instead of the normal
+                                   # 0-2.44 V. With the 3.235 divider the gauge's full
+                                   # 8.6 V maps to 2.66 V: the normal range clips it at
+                                   # ≈ 1-2e-3 mbar, the special range doesn't.
+                                   # Cost: ~2× coarser steps (≈ 1 % in pressure).
+VACUUM_AIN_NEG        = 32 if VACUUM_AIN_SPECIAL else 31   # 31 = single-ended vs GND
 LABJACK_SAMPLE_HZ     = 10         # internal sampling rate
 
 KELLER_BAUD        = 9600
@@ -486,7 +501,8 @@ def labjack_thread():
             lj.getCalibrationData()
             lj.configIO(FIOAnalog=0x04)   # FIO2 as analogue input (vacuum gauge)
             _labjack_ok = True
-            log_event("LabJack connected  FIO2 analog")
+            log_event("LabJack connected  FIO2 analog "
+                      f"({'0-3.6 V special' if VACUUM_AIN_SPECIAL else '0-2.44 V'} range)")
         except Exception as e:
             _labjack_ok = False
             log_event(f"LabJack connect failed: {e} — retry in 5 s")
@@ -530,7 +546,7 @@ def labjack_thread():
                     continue
 
                 try:
-                    raw  = lj.getAIN(LABJACK_FIO2_CHANNEL)
+                    raw  = lj.getAIN(LABJACK_FIO2_CHANNEL, VACUUM_AIN_NEG)
                     mbar = _voltage_to_vacuum_mbar(raw)
                     with _lock:
                         _state['vacuum_chamber_mbar'] = mbar
@@ -761,7 +777,7 @@ def _stream_selftest(lj, rate):
     try:
         lj.streamConfig(NumChannels=1,
                         PChannels=[LABJACK_FIO2_CHANNEL],
-                        NChannels=[31],            # 31 = single-ended vs GND
+                        NChannels=[VACUUM_AIN_NEG],   # same range as monitoring
                         Resolution=CAPTURE_RESOLUTION,
                         ScanFrequency=int(rate))
         lj.streamStart()
@@ -875,7 +891,7 @@ def _capture_stream_fire(lj, rate):
 
     lj.streamConfig(NumChannels=1,
                     PChannels=[LABJACK_FIO2_CHANNEL],
-                    NChannels=[31],
+                    NChannels=[VACUUM_AIN_NEG],
                     Resolution=CAPTURE_RESOLUTION,
                     ScanFrequency=int(rate))
     window_s = CAPTURE_PRE_S + CAPTURE_POST_S
