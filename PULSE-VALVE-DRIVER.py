@@ -1642,6 +1642,7 @@ DIM    = "#505050"
 BORDER = "#2a2a2a"
 WARN   = "#ff4040"
 GRID   = "#1a1a1a"
+VAC_LINE = "#2f8cff"   # vacuum chamber pressure (blue): trace and readout, as in the TE-valve driver
 
 
 class PVDGui:
@@ -1688,6 +1689,7 @@ class PVDGui:
         self.status_text.tag_config("dim",    foreground=DIM)
         self.status_text.tag_config("ok",     foreground=BRIGHT)
         self.status_text.tag_config("err",    foreground=WARN)
+        self.status_text.tag_config("vac",    foreground=VAC_LINE)
 
         # charts
         tk.Label(outer, text=f"─── upstream pressure (bar)  last {CHART_SECONDS}s",
@@ -1979,13 +1981,14 @@ class PVDGui:
         self._update_hint()
 
     # ── chart drawing ───────────────────────────────────────────────────────
-    def _draw_chart(self, canvas, data, fmt="{:.3f}", log=False):
+    def _draw_chart(self, canvas, data, fmt="{:.3f}", log=False, color=BRIGHT):
         """Draw a strip chart on *canvas*.
 
         data : sequence of values (oldest → newest)
         fmt  : format string for the y-axis tick labels
         log  : if True, plot log10 of the data (for vacuum pressure, which
                spans orders of magnitude). Non-positive values are skipped.
+        color: colour of the trace
         """
         c = canvas
         c.delete("all")
@@ -2031,7 +2034,7 @@ class PVDGui:
             x = pad_l + (w - pad_l - pad_r) * i / (n - 1)
             y = (h - pad_y) - (h - 2 * pad_y) * (v - lo) / span
             pts.extend((x, y))
-        c.create_line(*pts, fill=BRIGHT, width=1)
+        c.create_line(*pts, fill=color, width=1)
 
     # ── polling loop ────────────────────────────────────────────────────────
     def _poll(self):
@@ -2101,7 +2104,7 @@ class PVDGui:
         st.insert("end", "TEMPERATURE  ", "dim") ; st.insert("end", t_s + "\n",
                   "bright" if t   is not None else "dim")
         st.insert("end", "VACUUM       ", "dim") ; st.insert("end", v_s + "\n",
-                  "bright" if vac_disp is not None
+                  "vac" if vac_disp is not None
                   else ("err" if vac_st else "dim"))
         st.insert("end", "\n")
         st.insert("end", "PULSES       ", "dim")
@@ -2130,7 +2133,8 @@ class PVDGui:
 
         self._draw_chart(self.canvas,      _smooth_display(chart, n_k),      fmt="{:.3f}")
         self._draw_chart(self.temp_canvas, _smooth_display(temp_chart, n_k), fmt="{:.1f}")
-        self._draw_chart(self.vac_canvas,  _smooth_display(vac_chart, n_v),  fmt="{:.3e}", log=True)
+        self._draw_chart(self.vac_canvas,  _smooth_display(vac_chart, n_v),  fmt="{:.3e}", log=True,
+                         color=VAC_LINE)
 
         text = "\n".join(f"> {s}  {m}" for s, m in events[-200:])
         if getattr(self, "_last_log_text", None) != text:
