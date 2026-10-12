@@ -38,6 +38,9 @@ Driver commands
 ---------------
   v                       fire one pulse (no capture)
   c [n]                   capture n pulses at high rate, with a summary after a run
+  pp [dt ms ...]          paired-pulse test: is the upstream capillary a brake (A)
+                          or a reservoir (B)? (default dt sweep: PAIR_DT_MS)
+  pp stop                 end the paired-pulse test early and summarise
   t <µs>                  set open time
   cap <up|down> <id> <len>  record a capillary (bore µm, length mm)
   cap up none             record that no upstream capillary is fitted
@@ -67,8 +70,10 @@ import time
 import csv
 import os
 import math
+import random
+import re
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import tkinter as tk
@@ -171,6 +176,23 @@ CAPTURE_DECIMATE    = 10       # samples averaged per analysis point
 CAPTURE_SETTLE_S    = 3.0      # pause between shots in a multi-shot run (s)
 STREAM_SELFTEST_S   = 0.75     # sustained self-test span per rate rung (s)
 
+# ─── Paired-pulse test (pp) ───────────────────────────────────────────────────
+# Does gas flow freely through the upstream capillary during a pulse (A, the
+# capillary as a brake), or is only the gas stored near the valve released (B,
+# the capillary as a reservoir that then refills)? Fire two pulses dt apart in
+# one capture and compare the gas they deliver with a single shot taken just
+# before: Q2/Q1 = I_pair / I_single - 1, with I the integral of the excess
+# pressure. In A the second dose equals the first at every dt; in B it is
+# smaller at short dt and recovers with the refill time tau. The pair is timed
+# by the ZC1 itself (shot series: G = 2 shots, CYCLE time C = dt), not by the
+# serial link, so dt is exact to the ZC1's µs timer.
+PAIR_DT_MS          = (1, 2, 3, 5, 10, 20, 50, 100)   # default dt sweep (ms)
+PAIR_REPEATS        = 8        # pairs averaged per dt, each with its own single reference
+PAIR_DT_MAX_MS      = 1000.0   # longest dt accepted (the pair must sit well inside the window)
+PAIR_FIT_TAU_S      = (1e-4, 10.0)   # tau search range for the recovery fit (s)
+PAIR_A_MIN          = 0.05     # smallest drop in the second dose counted as depletion
+                               # (B); below it, or within 2 SE of zero, it is A
+
 CHAMBER_VOLUME_L    = 15.586   # geometric estimate (5 combined cylinders); consistent
                                # with measured tau ~161 ms if pump line is DN63+.
                                # Pending final pump-line-diameter check vs Cornelia's 5 L.
@@ -260,7 +282,8 @@ MANIFEST_COLUMNS = [
     'capture_group_id', 'capture_shot_index', 'capture_group_size',
     'detected', 'flat_trace', 'gauge_invalid', 'invalid_samples',
     'capture_rate_hz', 'analysis_rate_hz',
-    'open_time_us', 'zc1_ack',
+    'open_time_us', 'zc1_ack', 'shots_per_fire', 'pair_dt_us',
+    'pairtest_dt_ms', 'pairtest_repeat', 'pairtest_role',
     'downstream_cap_id_um', 'downstream_cap_length_mm',
     'upstream_cap_id_um', 'upstream_cap_length_mm',
     'gas_species',
@@ -348,6 +371,8 @@ _summary_window  = 0                   # shots in the current multi-shot run
 _capture_group_id    = None            # shared id for the shots of one `c n` run
 _capture_group_size  = 0               # shots requested in the current `c n` run
 _capture_group_index = 0               # shots started so far in the current run
+_pairtest        = None                # dict while a paired-pulse test (pp) runs
+_pairtest_cancel = threading.Event()   # GUI -> LabJack thread: end the pp test early
 
 
 def log_event(text: str):
@@ -560,6 +585,33 @@ def labjack_thread():
                 # on this thread. Monitoring pauses for the window and resumes
                 # automatically. A multi-shot run re-arms itself here.
                 global _capture_busy, _capture_pending, _capture_group_index
+                global _pairtest
+                pt = _pairtest
+                if pt is not None and not _capture_request.is_set():
+                    if _pairtest_cancel.is_set() or not pt['plan']:
+                        _pairtest_finish(pt, cancelled=_pairtest_cancel.is_set())
+                        _pairtest = None
+                        _pairtest_cancel.clear()
+                        continue
+                    if time.time() >= pt['next_t']:
+                        step = pt['plan'].popleft()
+                        _capture_busy = True
+                        try:
+                            _pairtest_step(lj, pt, step)
+                        except Exception as e:
+                            log_event(f"PAIR TEST: capture failed ({e}) — "
+                                      f"test stopped, reconnecting device")
+                            _capture_busy = False
+                            _pairtest_finish(pt, cancelled=True)
+                            _pairtest = None
+                            break
+                        finally:
+                            _capture_busy = False
+                        # Monitoring resumes between captures; the next one
+                        # waits for the chamber to settle.
+                        pt['next_t'] = time.time() + CAPTURE_SETTLE_S
+                        continue
+
                 if _capture_request.is_set():
                     _capture_request.clear()
                     _capture_busy = True
@@ -753,6 +805,69 @@ def zc1_set_open_time(ser: serial.Serial, open_us: int):
     return open_us, reply
 
 
+def _zc1_read_param(ser: serial.Serial, letter: str):
+    """Read one ZC1 parameter (Typ-C, lower-case letter, e.g. 'g' = number of
+    shots, 'c' = CYCLE time). The reply is '.g00000002' then LF CR '>'.
+    Returns the integer, or None if the reply could not be parsed. Call with
+    _zc1_lock held."""
+    ser.reset_input_buffer()
+    ser.write(letter.encode('ascii'))
+    reply = _zc1_read_until_prompt(ser)
+    m = re.search(r'\.' + letter + r'(\d+)', reply)
+    return int(m.group(1)) if m else None
+
+
+def _zc1_write_param(ser: serial.Serial, value: int, letter: str) -> str:
+    """Set one ZC1 parameter (Typ-B, '<value><LETTER>'). Call with _zc1_lock held."""
+    ser.reset_input_buffer()
+    ser.write(f"{int(value)}{letter}".encode('ascii'))
+    return _zc1_read_until_prompt(ser)
+
+
+def zc1_arm_pair(ser: serial.Serial, dt_us: int):
+    """Set the ZC1 shot series to exactly two shots dt_us apart: G = 2, C = dt_us.
+
+    Both are read back. The ZC1 raises C to OPEN + 100 µs if it is shorter, so
+    the CYCLE time actually in force is returned and is what gets recorded.
+    Returns (ok, cycle_us, message). ok is False unless G reads back as 2 —
+    G powers up at its saved value (100 by default), and 'Q' with G = 100
+    would fire 100 pulses."""
+    with _zc1_lock:
+        try:
+            _zc1_write_param(ser, dt_us, 'C')
+            _zc1_write_param(ser, 2, 'G')
+            c = _zc1_read_param(ser, 'c')
+            g = _zc1_read_param(ser, 'g')
+        except Exception as e:
+            return False, None, f"ZC1 error: {e}"
+    if g != 2:
+        return False, c, f"number of shots reads back {g!r}, not 2 — not fired"
+    if c is None:
+        return False, None, "CYCLE time could not be read back — not fired"
+    return True, c, ""
+
+
+def zc1_fire_pair(ser: serial.Serial, cycle_us: int, mark=None):
+    """Fire the armed two-shot series ('Q'). G is read back once more first,
+    and nothing is fired unless it is still 2. *mark* is called just before
+    'Q' is sent, to timestamp the fire. The ZC1 returns '>' only once the
+    series is done, so the wait allows for it. Returns (ok, message)."""
+    wait_s = _ZC1_TIMEOUT + 2 * cycle_us / 1e6
+    with _zc1_lock:
+        try:
+            g = _zc1_read_param(ser, 'g')
+            if g != 2:
+                return False, f"number of shots reads back {g!r}, not 2 — not fired"
+            if mark is not None:
+                mark()
+            ser.reset_input_buffer()
+            ser.write(b'Q')
+            reply = _zc1_read_until_prompt(ser, timeout_s=wait_s)
+            return ('>' in reply), ("" if '>' in reply else "no ZC1 prompt after Q")
+        except Exception as e:
+            return False, f"ZC1 error: {e}"
+
+
 def zc1_fire_pulse(ser: serial.Serial) -> bool:
     """Fire one pulse (Typ-A 'V' command).  Returns True if '>' prompt received.
 
@@ -793,6 +908,26 @@ def fire_one():
         ot = _state['open_time_us']
         _state['pulse_events'].append((ts, ot, ok))
     return ok, ot
+
+
+def fire_pair(cycle_us: int, mark=None):
+    """Fire the armed two-shot series and record both pulses. Returns
+    (ok, open_us, message). Nothing is fired unless the ZC1 confirms G = 2."""
+    global _zc1_ok
+    ok, msg = False, "no device"
+    if _zc1_serial is not None and _zc1_ok:
+        ok, msg = zc1_fire_pair(_zc1_serial, cycle_us, mark=mark)
+    t0 = datetime.now()
+    with _lock:
+        ot = _state['open_time_us']
+        if ok:
+            _state['pulse_interval'] += 2
+            _state['pulses_total']   += 2
+            for k in range(2):
+                ts = (t0 + timedelta(microseconds=k * cycle_us)).isoformat(
+                    timespec='microseconds')
+                _state['pulse_events'].append((ts, ot, True))
+    return ok, ot, msg
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -920,10 +1055,12 @@ def _median(vals):
     return s[m] if n % 2 else 0.5 * (s[m - 1] + s[m])
 
 
-def _capture_stream_fire(lj, rate):
-    """Stream AIN2 at *rate*, firing one pulse after CAPTURE_PRE_S.
+def _capture_stream_fire(lj, rate, pair_cycle_us=None):
+    """Stream AIN2 at *rate*, firing one pulse after CAPTURE_PRE_S — or, with
+    *pair_cycle_us*, the armed two-shot ZC1 series (see zc1_arm_pair).
 
-    Returns (volts, fire_index, fire_ok, open_us, missed, up_bar, up_degC).
+    Returns (volts, fire_index, fire_ok, open_us, missed, up_bar, up_degC,
+    fire_msg).
     """
     pre_n   = int(rate * CAPTURE_PRE_S)
     total_n = int(rate * (CAPTURE_PRE_S + CAPTURE_POST_S))
@@ -941,7 +1078,15 @@ def _capture_stream_fire(lj, rate):
             t = _median(_keller_t_recent)
         fired['up_bar']  = round(p, 4) if p is not None else None
         fired['up_degC'] = round(t, 2) if t is not None else None
-        fired['ok'], fired['ot'] = fire_one()
+        if pair_cycle_us is None:
+            fired['ok'], fired['ot'] = fire_one()
+        else:
+            # G is re-checked before 'Q', a few ms after the thread starts, so
+            # the fire is timestamped at the moment 'Q' is sent.
+            def _mark():
+                fired['idx'] = len(volts)
+            fired['ok'], fired['ot'], fired['msg'] = fire_pair(
+                pair_cycle_us, mark=_mark)
 
     lj.streamConfig(NumChannels=1,
                     PChannels=[LABJACK_FIO2_CHANNEL],
@@ -993,9 +1138,10 @@ def _capture_stream_fire(lj, rate):
         log_event(f"CAPTURE: stream stalled at {len(volts)}/{total_n} "
                   f"samples @ {rate:g} Hz — aborted (would have hung)")
 
+    fire_idx = fired.get('idx', fire_idx)
     return (volts[:total_n], fire_idx,
             fired.get('ok', False), fired.get('ot'), missed,
-            fired.get('up_bar'), fired.get('up_degC'))
+            fired.get('up_bar'), fired.get('up_degC'), fired.get('msg', ''))
 
 
 def _decimate(values, factor):
@@ -1132,17 +1278,40 @@ def _write_capture_csv(times, mbar, meta, stem=None):
     return path
 
 
-def _run_capture(lj, shot_index=1, group_id=None, group_size=1):
+def _run_capture(lj, shot_index=1, group_id=None, group_size=1,
+                 pair_dt_us=None, extra=None):
     """Capture one pulse, analyse it, save it, and report to the event log.
 
     shot_index / group_id / group_size tie the shots of one `c n` run together;
-    they are stamped into the header and shared as a filename prefix."""
+    they are stamped into the header and shared as a filename prefix.
+    pair_dt_us fires a ZC1 two-shot series dt apart instead of one pulse (the
+    paired-pulse test); extra is stamped into the header and manifest.
+
+    Returns the shot's summary dict (with 'integral' in mbar*s) for a detected
+    or not-detected shot, None if there is nothing to analyse."""
     if group_id is None:
         group_id = datetime.now().strftime('%Y%m%d_%H%M%S')
     tag  = "" if group_size <= 1 else f" [{shot_index}/{group_size}]"
     stem = (f"pulse_{group_id}_s{shot_index:02d}"
             if group_size > 1 else f"pulse_{group_id}")
     grp  = _capture_group_meta(group_id, shot_index, group_size)
+    grp.update(extra or {})
+
+    cycle_us = None
+    if pair_dt_us is not None:
+        if not (_zc1_serial is not None and _zc1_ok):
+            log_event(f"CAPTURE{tag}: ZC1 offline — pair not fired")
+            return None
+        ok, cycle_us, msg = zc1_arm_pair(_zc1_serial, pair_dt_us)
+        if not ok:
+            log_event(f"CAPTURE{tag}: {msg}")
+            return None
+        if cycle_us != pair_dt_us:
+            log_event(f"CAPTURE{tag}: ZC1 CYCLE time is {cycle_us} µs, "
+                      f"not the {pair_dt_us} µs asked for — recorded as is")
+        grp.update({'shots_per_fire': 2, 'pair_dt_us': cycle_us})
+    else:
+        grp.setdefault('shots_per_fire', 1)
 
     rate = _choose_stream_rate(lj)
     if rate is None:
@@ -1153,12 +1322,17 @@ def _run_capture(lj, shot_index=1, group_id=None, group_size=1):
     log_event(f"CAPTURE{tag}: streaming "
               f"{CAPTURE_PRE_S + CAPTURE_POST_S:g} s @ {rate:g} Hz")
 
-    volts, fire_idx, fire_ok, open_us, missed, up_bar, up_degC = \
-        _capture_stream_fire(lj, rate)
+    volts, fire_idx, fire_ok, open_us, missed, up_bar, up_degC, fire_msg = \
+        _capture_stream_fire(lj, rate, pair_cycle_us=cycle_us)
     if missed:
         log_event(f"CAPTURE{tag}: {missed} samples missed by the stream")
     if fire_idx is None or len(volts) < CAPTURE_DECIMATE * 20:
         log_event(f"CAPTURE{tag}: capture failed - too few samples")
+        return None
+    if cycle_us is not None and not fire_ok:
+        # A pair that did not fire would be analysed as a pair that delivered
+        # nothing — a false "fully depleted" result. Drop it.
+        log_event(f"CAPTURE{tag}: pair not fired ({fire_msg}) — discarded")
         return None
     if not fire_ok:
         log_event(f"CAPTURE{tag}: WARNING - no ZC1 ack; valve may not have fired")
@@ -1323,14 +1497,16 @@ def _run_capture(lj, shot_index=1, group_id=None, group_size=1):
             'peak_snr': f"{peak_snr:.2f}",
             'detect_t_stat': f"{t_stat:.2f}",
             'dp_upper_bound_mbar': f"{ub:.6e}",
+            'integral_mbar_s': f"{integral:.6e}",
             'samples_missed': missed,
         }
         path = _write_capture_csv(times, mbar, meta, stem=stem)
         append_manifest(meta, path)
         log_event(f"CAPTURE{tag}: {os.path.basename(path)}")
-        _capture_runs.append(dict(meta, path=path, peak=None, tau=None,
-                                  detected=False))
-        return None
+        run = dict(meta, path=path, peak=None, tau=None, detected=False,
+                   integral=integral)
+        _capture_runs.append(run)
+        return run
 
     pct = 100.0 * peak / CHAMBER_LIMIT_MBAR
     log_event(f"CAPTURE{tag}: peak {peak:.3e} mbar  "
@@ -1399,8 +1575,206 @@ def _run_capture(lj, shot_index=1, group_id=None, group_size=1):
     run['peak'] = peak
     run['tau'] = tau
     run['detected'] = True
+    run['integral'] = integral
     _capture_runs.append(run)
     return run
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# PAIRED-PULSE TEST (pp) — capillary as brake (A) or reservoir (B)?
+# ═══════════════════════════════════════════════════════════════════════════════
+# Plan: PAIR_REPEATS rounds; each round visits every dt once, in shuffled
+# order, as [single shot, pair dt apart]. The single is the pair's reference,
+# taken seconds before it, so upstream drift cancels in the ratio; shuffling
+# keeps drift over the run from masquerading as recovery with dt. The plan runs
+# on the LabJack thread one capture at a time, with monitoring between them.
+#
+#   Q2/Q1 = I_pair / I_single - 1          (I = integral of the excess, mbar*s)
+#
+# S_eff and the chamber volume cancel, so the ratio needs no calibration. The
+# mean ratio per dt is fitted with  Q2/Q1 = 1 - a * exp(-dt / tau):
+#   a ~ 0       A: the capillary is a brake, gas flows through it freely
+#   a > 0       B: the second shot finds the reservoir near the valve depleted;
+#               tau is its refill time through the upstream capillary.
+
+PAIRTEST_COLUMNS = [
+    'pairtest_dt_ms', 'dt_actual_ms', 'repeat', 'open_time_us',
+    'upstream_bar_single', 'upstream_bar_pair',
+    'integral_single_mbar_s', 'integral_pair_mbar_s', 'q2_over_q1',
+    'single_trace_file', 'pair_trace_file',
+]
+
+
+def _pairtest_new(dts_ms, open_us):
+    """Build a paired-pulse test: the plan, the per-pair CSV and its state."""
+    tid = datetime.now().strftime('%Y%m%d_%H%M%S')
+    plan = deque()
+    for k in range(1, PAIR_REPEATS + 1):
+        order = list(dts_ms)
+        random.shuffle(order)
+        for dt in order:
+            plan.append({'dt_ms': dt, 'k': k, 'role': 'single'})
+            plan.append({'dt_ms': dt, 'k': k, 'role': 'pair'})
+    path = os.path.join(LOG_DIR, f"pvd-pairtest_{tid}.csv")
+    with open(path, 'w', newline='') as f:
+        csv.writer(f).writerow(PAIRTEST_COLUMNS)
+    with _lock:
+        ident = {k: _state[k] for k in (
+            'upstream_cap_id_um', 'upstream_cap_len_mm',
+            'downstream_cap_id_um', 'downstream_cap_len_mm', 'gas_species')}
+    return {'id': tid, 'plan': plan, 'n_total': len(plan), 'done': 0,
+            'refs': {}, 'rows': [], 'next_t': 0.0, 'csv': path,
+            'dts_ms': list(dts_ms), 'open_us': open_us, 'ident': ident}
+
+
+def _pairtest_step(lj, pt, step):
+    """Run one capture of the plan; after a pair, work out its Q2/Q1."""
+    pt['done'] += 1
+    dt_ms, k, role = step['dt_ms'], step['k'], step['role']
+    run = _run_capture(
+        lj, shot_index=pt['done'], group_id=f"pp{pt['id']}",
+        group_size=pt['n_total'],
+        pair_dt_us=(int(round(dt_ms * 1000)) if role == 'pair' else None),
+        extra={'pairtest_dt_ms': f"{dt_ms:g}", 'pairtest_repeat': k,
+               'pairtest_role': role})
+    if role == 'single':
+        pt['refs'][(dt_ms, k)] = run
+        return
+    ref = pt['refs'].pop((dt_ms, k), None)
+    if (run is None or ref is None or not ref.get('detected')
+            or not ref.get('integral') or ref['integral'] <= 0):
+        log_event(f"PAIR TEST: dt {dt_ms:g} ms, repeat {k}: no usable "
+                  f"pair or single reference — skipped")
+        return
+    ratio = run['integral'] / ref['integral'] - 1.0
+    dt_act = float(run.get('pair_dt_us') or dt_ms * 1000) / 1000.0
+    row = {
+        'pairtest_dt_ms': f"{dt_ms:g}", 'dt_actual_ms': f"{dt_act:g}",
+        'repeat': k, 'open_time_us': run.get('open_time_us', ''),
+        'upstream_bar_single': ref.get('upstream_bar_at_fire', ''),
+        'upstream_bar_pair': run.get('upstream_bar_at_fire', ''),
+        'integral_single_mbar_s': f"{ref['integral']:.6e}",
+        'integral_pair_mbar_s': f"{run['integral']:.6e}",
+        'q2_over_q1': f"{ratio:.5f}",
+        'single_trace_file': os.path.basename(ref.get('path', '')),
+        'pair_trace_file': os.path.basename(run.get('path', '')),
+    }
+    pt['rows'].append(dict(row, _dt=dt_act, _ratio=ratio))
+    try:
+        with open(pt['csv'], 'a', newline='') as f:
+            csv.DictWriter(f, fieldnames=PAIRTEST_COLUMNS).writerow(row)
+    except Exception as e:
+        log_event(f"PAIR TEST: could not append to {os.path.basename(pt['csv'])} ({e})")
+    log_event(f"PAIR TEST [{pt['done']}/{pt['n_total']}]: dt {dt_act:g} ms  "
+              f"Q2/Q1 = {ratio:.3f}")
+
+
+def _fit_recovery(points):
+    """Fit Q2/Q1 = 1 - a*exp(-dt/tau) to [(dt_s, mean, se), ...].
+
+    tau is searched on a log grid over PAIR_FIT_TAU_S; for each tau the best a
+    is linear least squares, weighted by 1/se² when every point has an se.
+    Returns (a, a_se, tau_s) or None. a_se is scaled up by the fit's reduced
+    chi-squared when the scatter is larger than the error bars say."""
+    if len(points) < 2:
+        return None
+    weighted = all(se and se > 0 for _, _, se in points)
+    lo, hi = PAIR_FIT_TAU_S
+    best = None
+    for i in range(400):
+        tau = lo * (hi / lo) ** (i / 399)
+        sxx = sxy = 0.0
+        for dt, m, se in points:
+            w = 1.0 / se ** 2 if weighted else 1.0
+            x = math.exp(-dt / tau)
+            sxx += w * x * x
+            sxy += w * x * (1.0 - m)
+        if sxx <= 0:
+            continue
+        a = sxy / sxx
+        chi = sum((1.0 / se ** 2 if weighted else 1.0)
+                  * ((1.0 - m) - a * math.exp(-dt / tau)) ** 2
+                  for dt, m, se in points)
+        if best is None or chi < best[0]:
+            best = (chi, a, tau, sxx)
+    if best is None:
+        return None
+    chi, a, tau, sxx = best
+    dof = len(points) - 2
+    red = chi / dof if dof > 0 else 1.0
+    a_se = math.sqrt(1.0 / sxx) * (math.sqrt(red) if (red > 1 or not weighted) else 1.0)
+    return a, a_se, tau
+
+
+def _pairtest_finish(pt, cancelled=False):
+    """Average the pairs per dt, fit the recovery and give the A/B verdict, in
+    the event log and in pvd-pairtest-summary_<id>.csv."""
+    rows = pt['rows']
+    head = "PAIR TEST: stopped early — " if cancelled else "PAIR TEST: done — "
+    log_event(f"{head}{len(rows)} usable pairs of {pt['n_total'] // 2} planned")
+    by_dt = {}
+    for r in rows:
+        by_dt.setdefault(r['_dt'], []).append(r['_ratio'])
+    table = []
+    for dt in sorted(by_dt):
+        v = by_dt[dt]
+        n = len(v)
+        m = sum(v) / n
+        sd = math.sqrt(sum((x - m) ** 2 for x in v) / (n - 1)) if n > 1 else None
+        se = sd / math.sqrt(n) if sd is not None else None
+        table.append((dt, n, m, sd, se))
+        log_event(f"PAIR TEST: dt {dt:>7g} ms  n {n}  Q2/Q1 {m:.3f}"
+                  + (f" ± {se:.3f} (SE)" if se is not None else ""))
+
+    fit = _fit_recovery([(dt / 1000.0, m, se) for dt, n, m, sd, se in table])
+    if fit is None or len(table) < 3:
+        verdict = "too few dt values with usable pairs for a verdict"
+        fit_s = ""
+    else:
+        a, a_se, tau = fit
+        fit_s = (f"Q2/Q1 = 1 - a*exp(-dt/tau): a = {a:.3f} ± {a_se:.3f}, "
+                 f"tau = {tau * 1000:.3g} ms")
+        dts_s = [dt / 1000.0 for dt, *_ in table]
+        if a <= max(2 * a_se, PAIR_A_MIN):
+            verdict = (f"A - brake: the second dose drops by no more than "
+                       f"{100 * max(2 * a_se, PAIR_A_MIN):.0f} % at short dt, so gas "
+                       f"flows through the capillary during the pulse")
+        else:
+            verdict = (f"B - reservoir: the second dose drops by {100 * a:.0f} % at "
+                       f"short dt and recovers with tau = {tau * 1000:.3g} ms "
+                       f"(refill of the gas near the valve)")
+            if tau < 0.5 * min(dts_s) or tau > 2 * max(dts_s):
+                verdict += " - tau lies outside the dt range, extend the sweep"
+    log_event(f"PAIR TEST: {fit_s}" if fit_s else "PAIR TEST: no fit")
+    log_event(f"PAIR TEST: verdict {verdict}")
+    log_event("PAIR TEST: control - repeat with 'cap up none'; a drop there "
+              "comes from the valve or the ZC1, not from the capillary")
+
+    path = os.path.join(LOG_DIR, f"pvd-pairtest-summary_{pt['id']}.csv")
+    try:
+        ident = pt['ident']
+        with open(path, 'w', newline='') as f:
+            w = csv.writer(f)
+            for k, v in (('verdict', verdict), ('fit', fit_s),
+                         ('cancelled', int(cancelled)),
+                         ('open_time_us', pt['open_us']),
+                         ('pairs_per_dt_planned', PAIR_REPEATS),
+                         ('upstream_cap_id_um', ident['upstream_cap_id_um']),
+                         ('upstream_cap_length_mm', ident['upstream_cap_len_mm']),
+                         ('downstream_cap_id_um', ident['downstream_cap_id_um']),
+                         ('downstream_cap_length_mm', ident['downstream_cap_len_mm']),
+                         ('gas_species', ident['gas_species']),
+                         ('pairs_file', os.path.basename(pt['csv']))):
+                w.writerow([f"# {k}", v])
+            w.writerow(['dt_ms', 'n_pairs', 'q2_over_q1_mean',
+                        'q2_over_q1_sd', 'q2_over_q1_se'])
+            for dt, n, m, sd, se in table:
+                w.writerow([f"{dt:g}", n, f"{m:.5f}",
+                            f"{sd:.5f}" if sd is not None else '',
+                            f"{se:.5f}" if se is not None else ''])
+        log_event(f"PAIR TEST: {os.path.basename(path)}")
+    except Exception as e:
+        log_event(f"PAIR TEST: could not write the summary ({e})")
 
 
 def _summarise_runs(n_last):
@@ -1653,6 +2027,7 @@ class PVDGui:
                               d        toggle auto-drive
                               r <Hz>   set drive rate
                               t <µs>   set open time
+                              pp [dt]  paired-pulse test (A brake / B reservoir)
                               q        quit
     """
 
@@ -1765,6 +2140,8 @@ class PVDGui:
         self._driver_print("")
         self._driver_print("  v              fire one pulse (no capture)")
         self._driver_print("  c [n]          capture n pulses at high rate")
+        self._driver_print("  pp [dt ms …]   paired-pulse test: capillary as brake (A) or reservoir (B)")
+        self._driver_print("  pp stop        end the paired-pulse test and summarise")
         self._driver_print("  t <µs>         set open time")
         self._driver_print("  cap <up|down> <id> <len>  set a capillary (bore µm, length mm)")
         self._driver_print("  cap up none    record that no upstream capillary is fitted")
@@ -1808,12 +2185,16 @@ class PVDGui:
             gas  = _state['gas_species']
         ident = (f"D:{_cap_fmt(d_id, d_ln, compact=True)} "
                  f"U:{_cap_fmt(u_id, u_ln, compact=True)} · {gas}")
-        if _capture_busy:
+        pt = _pairtest
+        if pt is not None:
+            self.hint_var.set(f"{ident}  |  open={ot} µs  |  PAIR TEST "
+                              f"{pt['done']}/{pt['n_total']}  (pp stop to end)")
+        elif _capture_busy:
             self.hint_var.set(f"{ident}  |  open={ot} µs  |  CAPTURING…")
         elif _capture_pending > 0:
             self.hint_var.set(f"{ident}  |  open={ot} µs  |  {_capture_pending} shot(s) queued")
         else:
-            self.hint_var.set(f"{ident}  |  open={ot} µs  | v  c[n]  t  cap  gas  q")
+            self.hint_var.set(f"{ident}  |  open={ot} µs  | v  c[n]  pp  t  cap  gas  q")
 
     def _on_cmd(self):
         raw = self.cmd_entry.get().strip()
@@ -1828,7 +2209,13 @@ class PVDGui:
         if cmd == "q":
             self.shutdown()
 
+        elif cmd == "pp":
+            self._pairtest_cmd(parts[1:])
+
         elif cmd == "v":
+            if _pairtest is not None:
+                self._driver_print("  pair test running — 'pp stop' first", "err")
+                return
             ok, ot = fire_one()
             status = "OK" if ok else ("no ACK" if _zc1_ok else "no device")
             self._driver_print(f"  pulse fired  {ot} µs  {status}",
@@ -1838,7 +2225,7 @@ class PVDGui:
         elif cmd == "c":
             global _capture_pending, _summary_window, _capture_group_id, \
                    _capture_group_size, _capture_group_index
-            if _capture_busy or _capture_request.is_set():
+            if _capture_busy or _capture_request.is_set() or _pairtest is not None:
                 self._driver_print("  capture already running", "err")
                 return
             if not _labjack_ok:
@@ -1895,6 +2282,60 @@ class PVDGui:
 
         else:
             self._driver_print(f"  unknown: '{cmd}'", "err")
+
+    def _pairtest_cmd(self, args):
+        """pp [dt_ms ...] starts the paired-pulse test; pp stop ends it early
+        (the pairs so far are still summarised)."""
+        global _pairtest
+        if args and args[0] == "stop":
+            if _pairtest is None:
+                self._driver_print("  no pair test running", "dim")
+            else:
+                _pairtest_cancel.set()
+                self._driver_print("  pair test stops after the current capture", "ok")
+            return
+        if _pairtest is not None:
+            self._driver_print("  pair test already running — 'pp stop' to end it", "err")
+            return
+        if _capture_busy or _capture_request.is_set() or _capture_pending > 0:
+            self._driver_print("  capture running — wait for it to finish", "err")
+            return
+        if not _labjack_ok:
+            self._driver_print("  no LabJack — pair test unavailable", "err")
+            return
+        if not _zc1_ok:
+            self._driver_print("  no ZC1 — pair test unavailable", "err")
+            return
+        try:
+            dts = [float(a) for a in args] if args else list(PAIR_DT_MS)
+        except ValueError:
+            self._driver_print("  usage: pp [dt_ms ...]   e.g. pp 1 2 5 10 20 50", "err")
+            return
+        with _lock:
+            ot = _state['open_time_us']
+        # The ZC1's CYCLE time is at least 300 µs and at least OPEN + 100 µs.
+        dt_min = max(0.3, (ot + 100) / 1000.0)
+        bad = [d for d in dts if not (dt_min <= d <= PAIR_DT_MAX_MS)]
+        dts = sorted(set(d for d in dts if dt_min <= d <= PAIR_DT_MAX_MS))
+        if bad:
+            self._driver_print(
+                f"  dropped {', '.join(f'{d:g}' for d in bad)} ms — dt must be "
+                f"{dt_min:g} to {PAIR_DT_MAX_MS:g} ms at open {ot} µs", "err")
+        if not dts:
+            self._driver_print("  no valid dt left — nothing to run", "err")
+            return
+        pt = _pairtest_new(dts, ot)
+        _pairtest = pt
+        n = pt['n_total']
+        mins = n * (CAPTURE_PRE_S + CAPTURE_POST_S + CAPTURE_SETTLE_S) / 60.0
+        self._driver_print(
+            f"  pair test armed — dt {', '.join(f'{d:g}' for d in dts)} ms, "
+            f"{PAIR_REPEATS} pairs each, every pair with its own single "
+            f"reference: {n} captures, ~{mins:.0f} min", "ok")
+        self._driver_print("  'pp stop' ends it early; the pairs so far are summarised", "dim")
+        log_event(f"PAIR TEST: started — dt {', '.join(f'{d:g}' for d in dts)} ms, "
+                  f"{PAIR_REPEATS} pairs each, open {ot} µs ({n} captures)")
+        self._update_hint()
 
     def _set_rate(self, s):
         try:

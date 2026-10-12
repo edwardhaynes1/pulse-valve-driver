@@ -69,6 +69,8 @@ python PULSE-VALVE-DRIVER.py
 |---|---|
 | `v` | Fire one pulse, no capture |
 | `c [n]` | Capture n pulses at high rate (default 1, max 50) |
+| `pp [dt_ms …]` | Paired-pulse test: is the upstream capillary a brake (A) or a reservoir (B)? Default dt sweep `PAIR_DT_MS` |
+| `pp stop` | End the paired-pulse test early; the pairs so far are summarised |
 | `t <µs>` | Set open time (50 – 5 000 000 µs) |
 | `cap <up\|down> <id_µm> <len_mm>` | Record a capillary on the given side (bore in µm, length in mm) |
 | `cap up none` | Record that no upstream capillary is fitted |
@@ -114,6 +116,28 @@ The shots of one `c n` run are tied together so the files are identifiable as a 
 The stream rate is probed at the first capture: a ladder of rates is tried fastest-first and the first one the U3 sustains cleanly is cached for the session. The probe runs before the valve is armed, so a rejected rate never wastes a shot.
 
 **Why capture exists.** The 10 Hz monitoring loop samples every 100 ms. A pulse transient decays with a time constant of order 100 ms (unlimited) to several seconds (restrictive limiter), so the "peak" the monitoring loop records is wherever the sampler happened to land — systematically low, by an amount that cannot be recovered afterwards. Capture samples fast enough that the recorded peak is the peak the gauge saw.
+
+### Paired-pulse test (`pp`)
+
+Does gas flow freely through the upstream capillary during a pulse (**A**, the capillary as a brake), or is only the gas stored near the valve released (**B**, the capillary as a reservoir that then refills)? `pp` fires two pulses Δt apart inside one capture and compares the gas they deliver with a single shot taken just before:
+
+```
+Q2/Q1 = I_pair / I_single − 1        (I = integral of the excess pressure, mbar·s)
+```
+
+The chamber volume and S_eff cancel, so the ratio needs no calibration. In A the second dose equals the first at every Δt; in B it is smaller at short Δt and recovers as the reservoir refills. The mean ratio per Δt is fitted with
+
+```
+Q2/Q1 = 1 − a · exp(−Δt / τ)
+```
+
+and the driver gives the verdict: **A** if `a` is within 2 standard errors of zero or below `PAIR_A_MIN` (5 %), otherwise **B**, with `τ` the refill time of the gas near the valve.
+
+- **Plan.** `PAIR_REPEATS` (8) rounds; each round visits every Δt once, in shuffled order, as a single shot followed by a pair. Every pair is compared with its own single taken seconds before it, so upstream drift cancels, and shuffling keeps drift across the run from looking like recovery with Δt. The default sweep (1–100 ms, 8 values) is 128 captures, about 19 minutes. Monitoring continues between captures.
+- **Timing by the ZC1.** The pair is the ZC1's own shot series: number of shots G = 2, CYCLE time C = Δt, fired with `Q`. Δt is therefore set by the ZC1's µs timer, not by the serial link. The ZC1 needs C ≥ 300 µs and C ≥ OPEN + 100 µs, so Δt values below that for the current open time are dropped with a note; the CYCLE time read back from the ZC1 is what is recorded.
+- **Safety.** G powers up at its saved value (100 by default), and `Q` with G = 100 would fire 100 pulses. The driver sets G = 2 and reads it back before each pair, and reads it again immediately before sending `Q`; if it is not 2, nothing is fired and the pair is skipped. G is left at 2 afterwards.
+- **Output.** `pvd-pairtest_<ts>.csv` gets one row per pair as it completes (Δt asked for and in force, both integrals, Q2/Q1, upstream pressure at each fire, both trace files). At the end, `pvd-pairtest-summary_<ts>.csv` holds the verdict, the fit and the run identity in its header, and the mean, standard deviation and standard error of Q2/Q1 per Δt. Every capture is also in the manifest, with `shots_per_fire`, `pair_dt_us`, `pairtest_dt_ms`, `pairtest_repeat` and `pairtest_role`.
+- **Control.** Repeat the test with `cap up none`. A drop in the second dose without an upstream capillary comes from the valve or the ZC1's driver stage recovering, not from the capillary.
 
 ---
 

@@ -31,6 +31,10 @@ excluded from group statistics and reported separately — averaging a real
 pulse together with a shot that delivered nothing gives a meaningless
 middle value.
 
+Paired-pulse captures from the driver's `pp` test (`shots_per_fire,2`) are
+skipped unless --pairs is given, and then grouped apart from single shots:
+two pulses in one trace would distort a group of singles.
+
 Captures where the driver judged the gauge reading not valid
 (`gauge_invalid,1` in the header, blank samples in the trace) are skipped
 with a note: there is no pressure in them to analyse.
@@ -520,6 +524,13 @@ def analyse(times, mbar, base_fn, sd, volume_l):
 # LOADING AND GROUPING
 # ═══════════════════════════════════════════════════════════════════════════
 
+def capture_is_pair(path):
+    """True for a paired-pulse capture (two shots in one window, from the
+    driver's pp test), which must not be pooled with single shots."""
+    meta, _, _ = read_capture(path)
+    return str(meta.get("shots_per_fire", "1")).strip() == "2"
+
+
 def capture_is_invalid(path):
     """True if the driver flagged the capture's gauge readings as not valid
     (gauge_invalid in the header, or any blank sample)."""
@@ -531,6 +542,11 @@ def capture_is_invalid(path):
 def load_one(path, args):
     """Read one capture, analyse it, and return a record dict."""
     meta, times, mbar = read_capture(path)
+    # A paired-pulse capture gets its own group, never pooled with singles.
+    open_key = meta.get("open_time_us", "?")
+    if str(meta.get("shots_per_fire", "1")).strip() == "2":
+        dt_ms = float(meta.get("pair_dt_us") or 0) / 1000.0
+        open_key = f"{open_key} x2 dt {dt_ms:g} ms,"
     volume = args.volume if args.volume is not None else float(
         meta.get("chamber_volume_l", 15.586))
 
@@ -549,7 +565,7 @@ def load_one(path, args):
                 times=times, mbar=mbar, base_fn=base_fn, sd=bl["_sd"],
                 bl=bl, a=a, volume=volume, detected=detected,
                 started=capture_started(path, meta),
-                open_us=meta.get("open_time_us", "?"))
+                open_us=open_key)
 
 
 def group_by_open_time(records):
@@ -1419,6 +1435,9 @@ def main():
                          "default log-pressure axis")
     ap.add_argument("--out", default=None,
                     help="save to file instead of showing interactively")
+    ap.add_argument("--pairs", action="store_true",
+                    help="include paired-pulse captures from the pp test, "
+                         "grouped apart from single shots")
     args = ap.parse_args()
 
     paths = expand_paths(args.csv) if args.csv else choose_csv_files()
@@ -1426,6 +1445,10 @@ def main():
     records = []
     for p in paths:
         print(f"  {os.path.basename(p)}")
+        if capture_is_pair(p) and not args.pairs:
+            print("    skipped - paired-pulse capture (the driver's pp test "
+                  "summarises these; use --pairs to plot them)")
+            continue
         if capture_is_invalid(p):
             print("    skipped - gauge reading not valid in this capture "
                   "(see its header), nothing to analyse")
