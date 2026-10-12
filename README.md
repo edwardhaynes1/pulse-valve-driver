@@ -131,7 +131,7 @@ The logger flushes on a fixed cadence but writes **one row per raw Keller sample
 | `keller_pressure_bar` | Raw upstream pressure sample for this row (blank on a no-sample row) |
 | `keller_temperature_degC` | Raw upstream temperature sample for this row (blank on a no-sample row) |
 | `n_keller_samples` | 1 = this row carries a raw Keller sample; 0 = a flush with no sample (e.g. sensor offline) |
-| `vacuum_chamber_mbar` | Vacuum gauge reading |
+| `vacuum_chamber_mbar` | Vacuum gauge reading (blank if not valid — see *Vacuum gauge calibration*) |
 | `pulses_interval` | Pulses fired since last row |
 | `pulses_total` | Cumulative pulse count |
 | `open_time_us` | Valve open-time setting |
@@ -143,6 +143,7 @@ The logger flushes on a fixed cadence but writes **one row per raw Keller sample
 | `upstream_cap_id_um` | Upstream capillary bore (µm), 0 if none fitted |
 | `upstream_cap_length_mm` | Upstream capillary length (mm), 0 if none fitted |
 | `gas_species` | Gas at the valve (recorded only; gauge still reads N₂-equivalent) |
+| `vacuum_status` | Blank = valid reading; otherwise why `vacuum_chamber_mbar` is blank |
 
 Rows with no pulse in their interval leave the three `pulse_*` columns blank, so filtering to pulse rows is simply a matter of selecting rows where `pulse_timestamps_us` is non-empty. The three identity columns are stamped on every row, so a mid-session `cap` / `gas` change is visible as the exact row where the values switch.
 
@@ -191,7 +192,7 @@ df[df.detected == 1].groupby("open_time_us").peak_mbar.agg(["mean", "std", "coun
 
 Its timestamp matches the session log's, so `pvd-log_<ts>.csv` and `pvd-captures_<ts>.csv` are an obvious pair. Rows are appended as each shot completes, so the file is usable mid-run and survives an interrupted session.
 
-Every shot is recorded, including non-detections (where `dp_upper_bound_mbar` carries the upper bound instead of a peak) and flat-trace faults (`flat_trace = 1`), so the manifest is a complete account of the session rather than only its successes. The column set is fixed and the three outcome types write blanks for fields that don't apply, so every row aligns.
+Every shot is recorded, including non-detections (where `dp_upper_bound_mbar` carries the upper bound instead of a peak) flat-trace faults (`flat_trace = 1`) and captures with gauge readings that are not valid (`gauge_invalid = 1`, with the count in `invalid_samples`), so the manifest is a complete account of the session rather than only its successes. The column set is fixed and the four outcome types write blanks for fields that don't apply, so every row aligns.
 
 **Traces stay where they are.** The manifest holds scalars only; the dense time series remain in their own per-shot `pulse_*.csv` files. The two have genuinely different shapes — one row per shot versus a few thousand rows per shot — and merging them would swamp the summary that makes the manifest useful, so the manifest indexes the traces rather than absorbing them.
 
@@ -307,6 +308,8 @@ U_gauge = 3.235 × V_LabJack                     (VACUUM_DIVIDER_RATIO)
 so `log10(P / mbar) ≈ 4.044 × V_LabJack − 12.75`. The divider ratio was calibrated at 1.713 V ↔ 1.5e-6 mbar.
 
 FIO2 is read on the U3-LV's special 0–3.6 V range (`VACUUM_AIN_SPECIAL`), both in monitoring and in capture streaming. With the divider, the gauge's full 8.6 V maps to 2.66 V, which the normal 0–2.44 V range would clip at about 1–2e-3 mbar. See `VACUUM-DIAG.py` for a standalone diagnostic.
+
+**Readings that are not pressures are not recorded as pressures.** A reading is not valid when the LabJack input is at or above `LABJACK_AIN_SAT_V` (clipped), or when the gauge-side voltage (LabJack volts × divider) is below `VACUUM_GAUGE_ERROR_V` (0.5 V: sensor error or no supply), below `VACUUM_GAUGE_MIN_V` (1.96 V: underrange or not yet ignited) or above `VACUUM_GAUGE_MAX_V` (8.6 V: overrange, > 1e-2 mbar) — the same ranges as the TE-valve driver. Such a reading is logged blank with the reason in `vacuum_status`, shown as `---` with the reason in the live readout, left out of the strip chart, and noted once in the event log when the gauge leaves and re-enters its valid range. A capture with any invalid sample is not analysed: its trace is written with those samples blank, the header and manifest carry `gauge_invalid = 1` and `invalid_samples`, and PULSE-PLOTTER skips it.
 
 Gauge readings are gas-species dependent. The IKR 270's displayed value is calibrated for air/N₂; multiply by the manufacturer's factor for other species (H₂ ≈ 2.4, He ≈ 5.9, Ar ≈ 0.8). A 10⁻⁶ mbar limit in hydrogen therefore corresponds to a displayed ~4×10⁻⁷. The `gas_species` field records which gas was used, but the conversion above is **not** adjusted automatically — apply the factor when you analyse.
 

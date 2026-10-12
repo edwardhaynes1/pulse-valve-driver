@@ -31,6 +31,10 @@ excluded from group statistics and reported separately — averaging a real
 pulse together with a shot that delivered nothing gives a meaningless
 middle value.
 
+Captures where the driver judged the gauge reading not valid
+(`gauge_invalid,1` in the header, blank samples in the trace) are skipped
+with a note: there is no pressure in them to analyse.
+
 Everything is recomputed from the raw trace, so the chamber volume can be
 changed after the fact without retaking any data.
 
@@ -315,7 +319,9 @@ def read_capture(path):
                 continue
             else:
                 times.append(float(row[0]))
-                mbar.append(float(row[1]))
+                # blank = the driver judged the gauge reading not valid
+                mbar.append(float(row[1]) if len(row) > 1 and row[1].strip()
+                            else None)
     if len(times) < 20:
         print(f"{os.path.basename(path)} does not look like a pulse capture "
               f"(only {len(times)} data rows).")
@@ -513,6 +519,14 @@ def analyse(times, mbar, base_fn, sd, volume_l):
 # ═══════════════════════════════════════════════════════════════════════════
 # LOADING AND GROUPING
 # ═══════════════════════════════════════════════════════════════════════════
+
+def capture_is_invalid(path):
+    """True if the driver flagged the capture's gauge readings as not valid
+    (gauge_invalid in the header, or any blank sample)."""
+    meta, _, mbar = read_capture(path)
+    return (str(meta.get("gauge_invalid", "0")).strip() not in ("0", "")
+            or any(p is None for p in mbar))
+
 
 def load_one(path, args):
     """Read one capture, analyse it, and return a record dict."""
@@ -1412,7 +1426,14 @@ def main():
     records = []
     for p in paths:
         print(f"  {os.path.basename(p)}")
+        if capture_is_invalid(p):
+            print("    skipped - gauge reading not valid in this capture "
+                  "(see its header), nothing to analyse")
+            continue
         records.append(load_one(p, args))
+    if not records:
+        print("No capture with valid gauge readings to plot.")
+        sys.exit(1)
     volume = records[0]["volume"]
 
     single = len(records) == 1

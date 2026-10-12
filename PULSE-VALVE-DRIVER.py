@@ -25,7 +25,9 @@ CSV columns
 -----------
   timestamp, keller_pressure_bar, keller_temperature_degC,
   vacuum_chamber_mbar, pulses_interval, pulses_total,
-  drive_active, drive_rate_hz, open_time_us
+  drive_active, drive_rate_hz, open_time_us, vacuum_status
+  (vacuum_chamber_mbar is blank when the gauge reading is not valid;
+  vacuum_status says why)
 
 Logging cadence
 ---------------
@@ -109,6 +111,15 @@ VACUUM_AIN_SPECIAL    = True       # read FIO2 on the U3-LV "special" 0-3.6 V ra
                                    # ≈ 1-2e-3 mbar, the special range doesn't.
                                    # Cost: ~2× coarser steps (≈ 1 % in pressure).
 VACUUM_AIN_NEG        = 32 if VACUUM_AIN_SPECIAL else 31   # 31 = single-ended vs GND
+# A reading outside the gauge's valid signal range is not a pressure: it is
+# logged blank, shown as its status, and kept out of the chart and of capture
+# analysis — never stored as a made-up number. Same ranges as the TE-valve driver.
+VACUUM_GAUGE_ERROR_V  = 0.5        # gauge side: below = sensor error / no supply
+VACUUM_GAUGE_MIN_V    = 1.96       # gauge side: below = underrange (<5e-11 mbar) or not ignited
+VACUUM_GAUGE_MAX_V    = 8.6        # gauge side: above = overrange (>1e-2 mbar)
+LABJACK_AIN_SAT_V     = 3.55 if VACUUM_AIN_SPECIAL else 2.40
+                                   # at or above this the reading is CLIPPED, not a
+                                   # pressure. None = don't check.
 LABJACK_SAMPLE_HZ     = 10         # internal sampling rate
 
 KELLER_BAUD        = 9600
@@ -237,8 +248,8 @@ LOG_FILE = _make_log_path()
 # pulse_*.csv files; this manifest is the index across them, so all of a
 # session's captures sit in one table for scatter / tau / regression work
 # without opening dozens of files. `trace_file` on each row points back to the
-# full trace. The column set is FIXED (below): the detected, not-detected and
-# flat-trace cases each carry a different subset of fields, so a fixed schema
+# full trace. The column set is FIXED (below): the detected, not-detected,
+# flat-trace and invalid-gauge cases each carry a different subset of fields, so a fixed schema
 # with blanks for the missing ones keeps every row aligned. Named to match the
 # session log's stamp so the pair is obvious: pvd-log_<ts> / pvd-captures_<ts>.
 MANIFEST_FILE = os.path.join(
@@ -247,7 +258,7 @@ MANIFEST_FILE = os.path.join(
 
 MANIFEST_COLUMNS = [
     'capture_group_id', 'capture_shot_index', 'capture_group_size',
-    'detected', 'flat_trace',
+    'detected', 'flat_trace', 'gauge_invalid', 'invalid_samples',
     'capture_rate_hz', 'analysis_rate_hz',
     'open_time_us', 'zc1_ack',
     'downstream_cap_id_um', 'downstream_cap_length_mm',
@@ -270,11 +281,11 @@ _manifest_lock = threading.Lock()   # captures are serialised on the LabJack
 def append_manifest(meta: dict, trace_path):
     """Append one summary row for a capture to MANIFEST_FILE.
 
-    Called for every shot that produced a file (detected, not-detected, and
-    flat-trace alike), so the manifest is a complete record of the session's
-    captures — a non-detection is a real result (an upper bound), not nothing.
+    Called for every shot that produced a file (detected, not-detected,
+    flat-trace and invalid-gauge alike), so the manifest is a complete record
+    of the session's captures — a non-detection is a real result (an upper bound), not nothing.
     Uses the fixed MANIFEST_COLUMNS: unknown keys in *meta* are dropped and
-    missing ones written blank, so the three outcome shapes all append cleanly.
+    missing ones written blank, so the four outcome shapes all append cleanly.
     The header is written only when the file is first created."""
     row = dict(meta)
     row['trace_file'] = os.path.basename(trace_path) if trace_path else ''
@@ -301,7 +312,8 @@ _drive_on    = threading.Event()       # set => automatic valve drive is running
 _state       = dict(
     keller_pressure_samples     = [],    # accumulated between log rows, then averaged
     keller_temperature_samples  = [],    # accumulated between log rows, then averaged
-    vacuum_chamber_mbar         = None,  # latest single reading
+    vacuum_chamber_mbar         = None,  # latest single reading, None if not valid
+    vacuum_status               = None,  # None = valid, else why the reading is not
     pulse_interval              = 0,     # pulses fired since last log row (reset each row)
     pulses_total                = 0,
     open_time_us                = DEFAULT_OPEN_US,
@@ -473,7 +485,35 @@ def keller_thread(initial_port: str, initial_bus):
 # LABJACK U3 — VACUUM CHAMBER PRESSURE (FIO2)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _voltage_to_vacuum_mbar(volts: float) -> float:
+_SAT_MBAR = (10.0 ** (VACUUM_SLOPE * LABJACK_AIN_SAT_V + VACUUM_INTERCEPT)
+             if LABJACK_AIN_SAT_V is not None else None)
+VAC_ERROR       = "sensor error / no supply"
+VAC_UNDER       = "underrange or not yet ignited"
+VAC_OVER        = "overrange (>1e-2 mbar)"
+VAC_SATURATED   = (f"LabJack input saturated (>~{_SAT_MBAR:.0e} mbar)"
+                   if _SAT_MBAR and _SAT_MBAR < 1e-2 else "LabJack input saturated")
+
+
+def _vacuum_gauge_status(volts: float):
+    """Classify a LabJack voltage against the IKR 270 signal ranges.
+    Returns None if the reading is valid, otherwise one of the VAC_* strings."""
+    if LABJACK_AIN_SAT_V is not None and volts >= LABJACK_AIN_SAT_V:
+        return VAC_SATURATED                    # clipped at the LabJack input
+    u = volts * VACUUM_DIVIDER_RATIO            # back to gauge-side volts
+    if u < VACUUM_GAUGE_ERROR_V:
+        return VAC_ERROR
+    if u < VACUUM_GAUGE_MIN_V:
+        return VAC_UNDER
+    if u > VACUUM_GAUGE_MAX_V:
+        return VAC_OVER
+    return None
+
+
+def _voltage_to_vacuum_mbar(volts: float):
+    """LabJack voltage → chamber pressure in mbar, or None if the reading is
+    not valid (see _vacuum_gauge_status)."""
+    if _vacuum_gauge_status(volts) is not None:
+        return None
     return 10.0 ** (VACUUM_SLOPE * volts + VACUUM_INTERCEPT)
 
 
@@ -510,6 +550,7 @@ def labjack_thread():
             continue   # retry the outer loop
 
         # ── read loop — breaks on error to trigger reconnect ───────────────
+        vac_status = "startup"   # last gauge status, so changes are logged once
         try:
             while not _stop.is_set():
                 t0 = time.time()
@@ -548,8 +589,18 @@ def labjack_thread():
                 try:
                     raw  = lj.getAIN(LABJACK_FIO2_CHANNEL, VACUUM_AIN_NEG)
                     mbar = _voltage_to_vacuum_mbar(raw)
+                    status = _vacuum_gauge_status(raw)
+                    if status != vac_status:
+                        if status is not None:
+                            log_event(f"Vacuum gauge {status} — "
+                                      f"{raw:.3f} V at LabJack, "
+                                      f"{raw * VACUUM_DIVIDER_RATIO:.2f} V at gauge")
+                        elif vac_status != "startup":
+                            log_event("Vacuum gauge back in range")
+                        vac_status = status
                     with _lock:
                         _state['vacuum_chamber_mbar'] = mbar
+                        _state['vacuum_status'] = status
                         _vac_chart.append(mbar)
                 except Exception as e:
                     log_event(f"LabJack read error: {e}")
@@ -841,7 +892,9 @@ def _choose_stream_rate(lj):
 def _smooth_display(vals, n):
     """Trailing moving average for DISPLAY ONLY. Never applied to logged or
     captured data — smoothing there would blunt real features. Same length as
-    the input; each point averages up to the last n samples."""
+    the input; each point averages the valid values among the last n samples.
+    A sample that is None (not a valid reading) stays None, so it is never
+    painted over by its neighbours."""
     if n <= 1 or len(vals) < 2:
         return list(vals)
     out, run = [], []
@@ -849,7 +902,8 @@ def _smooth_display(vals, n):
         run.append(v)
         if len(run) > n:
             run.pop(0)
-        out.append(sum(run) / len(run))
+        good = [x for x in run if x is not None]
+        out.append(sum(good) / len(good) if v is not None else None)
     return out
 
 
@@ -1073,7 +1127,8 @@ def _write_capture_csv(times, mbar, meta, stem=None):
             w.writerow([f"# {k}", v])
         w.writerow(['t_s', 'mbar'])          # t = 0 at the fire command
         for t, p in zip(times, mbar):
-            w.writerow([f"{t:.5f}", f"{p:.6e}"])
+            # blank = not a valid gauge reading
+            w.writerow([f"{t:.5f}", f"{p:.6e}" if p is not None else ''])
     return path
 
 
@@ -1110,9 +1165,42 @@ def _run_capture(lj, shot_index=1, group_id=None, group_size=1):
 
     dt    = CAPTURE_DECIMATE / rate
     v_dec = _decimate(volts, CAPTURE_DECIMATE)
-    mbar  = [_voltage_to_vacuum_mbar(v) for v in v_dec]
     i_fire = fire_idx // CAPTURE_DECIMATE
     times  = [(i - i_fire) * dt for i in range(len(v_dec))]
+
+    # ---- is every reading a valid pressure? ---------------------------------
+    # Judged on the raw samples, so a clipped peak cannot hide inside a block
+    # average. A block with any invalid sample is written blank, and the shot
+    # is not analysed: a baseline, peak or tau built on readings that are not
+    # pressures would be a made-up number.
+    raw_status = [_vacuum_gauge_status(v) for v in volts]
+    bad = {}
+    for st_ in raw_status:
+        if st_ is not None:
+            bad[st_] = bad.get(st_, 0) + 1
+    if bad:
+        mbar = []
+        for i, v in enumerate(v_dec):
+            blk = raw_status[i * CAPTURE_DECIMATE:(i + 1) * CAPTURE_DECIMATE]
+            mbar.append(None if any(blk) else _voltage_to_vacuum_mbar(v))
+        n_bad = sum(bad.values())
+        log_event(f"CAPTURE{tag}: *** GAUGE READING NOT VALID *** "
+                  f"{n_bad} of {len(volts)} samples - "
+                  + "; ".join(f"{k}: {n}" for k, n in bad.items()))
+        log_event(f"CAPTURE{tag}: no analysis attempted")
+        bad_meta = {'detected': 0, 'gauge_invalid': 1,
+                    'invalid_samples': n_bad,
+                    'capture_rate_hz': rate,
+                    'open_time_us': open_us,
+                    'zc1_ack': int(bool(fire_ok)),
+                    **grp,
+                    **_run_conditions(up_bar, up_degC),
+                    'samples_missed': missed}
+        path = _write_capture_csv(times, mbar, bad_meta, stem=stem)
+        append_manifest(bad_meta, path)
+        log_event(f"CAPTURE{tag}: {os.path.basename(path)}")
+        return None
+    mbar = [_voltage_to_vacuum_mbar(v) for v in v_dec]
 
     # Baseline from the pre-trigger region, ending a little before the fire so
     # nothing from the rise leaks into it.
@@ -1439,7 +1527,11 @@ def valve_drive_thread():
 #   n_keller_samples, vacuum_chamber_mbar, pulses_interval, pulses_total,
 #   open_time_us, pulse_timestamps_us, pulse_open_times_us, pulse_acks,
 #   downstream_cap_id_um, downstream_cap_length_mm,
-#   upstream_cap_id_um, upstream_cap_length_mm, gas_species
+#   upstream_cap_id_um, upstream_cap_length_mm, gas_species, vacuum_status
+#
+# vacuum_chamber_mbar is blank when the gauge reading is not valid (outside
+# the IKR 270's signal range, or the LabJack input saturated); vacuum_status
+# then says why.
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def logger_thread():
@@ -1466,6 +1558,7 @@ def logger_thread():
             'upstream_cap_id_um',       # upstream capillary bore (0 = none)
             'upstream_cap_length_mm',   # upstream capillary length (0 = none)
             'gas_species',              # gas in force for this row
+            'vacuum_status',            # blank = valid reading, else why vacuum_chamber_mbar is blank
         ])
         f.flush()
 
@@ -1482,6 +1575,7 @@ def logger_thread():
                 _state['keller_temperature_samples'] = []
 
                 vac    = _state['vacuum_chamber_mbar']
+                vac_st = _state['vacuum_status'] or ''
                 p_int  = _state['pulse_interval']
                 p_tot  = _state['pulses_total']
                 ot     = _state['open_time_us']
@@ -1514,7 +1608,7 @@ def logger_thread():
                     (pulse_ts   if with_pulses else ''),
                     (pulse_ots  if with_pulses else ''),
                     (pulse_acks if with_pulses else ''),
-                    d_id_s, d_ln_s, u_id_s, u_ln_s, gas,
+                    d_id_s, d_ln_s, u_id_s, u_ln_s, gas, vac_st,
                 ]
 
             if pending:
@@ -1963,6 +2057,7 @@ class PVDGui:
             p      = (sum(p_samp) / len(p_samp)) if p_samp else None
             t      = (sum(t_samp) / len(t_samp)) if t_samp else None
             vac    = _state['vacuum_chamber_mbar']
+            vac_st = _state['vacuum_status']
             ptot   = _state['pulses_total']
             pint   = _state['pulse_interval']
             rate   = _state['drive_rate_hz']
@@ -1978,11 +2073,15 @@ class PVDGui:
         # the number stops chasing gauge noise. Display only — the log is raw.
         n_k = max(1, round(DISPLAY_SMOOTH_S * KELLER_POLL_HZ))
         n_v = max(1, round(DISPLAY_SMOOTH_S * LABJACK_SAMPLE_HZ))
-        vac_disp = (sum(vac_chart[-n_v:]) / len(vac_chart[-n_v:])) if vac_chart else vac
+        vac_disp = (_smooth_display(vac_chart[-n_v:], n_v)[-1]
+                    if vac_chart else vac)
 
         p_s  = f"{p:.4f} bar"    if p   is not None else "---"
         t_s  = f"{t:.1f} °C"     if t   is not None else "---"
-        v_s  = f"{vac_disp:.2e} mbar" if vac_disp is not None else "---"
+        if vac_disp is not None:
+            v_s = f"{vac_disp:.2e} mbar"
+        else:
+            v_s = f"--- ({vac_st})" if vac_st else "---"
         d_s  = f"ON  {rate:g} Hz" if driving else "off"
 
         st = self.status_text
@@ -2002,7 +2101,8 @@ class PVDGui:
         st.insert("end", "TEMPERATURE  ", "dim") ; st.insert("end", t_s + "\n",
                   "bright" if t   is not None else "dim")
         st.insert("end", "VACUUM       ", "dim") ; st.insert("end", v_s + "\n",
-                  "bright" if vac_disp is not None else "dim")
+                  "bright" if vac_disp is not None
+                  else ("err" if vac_st else "dim"))
         st.insert("end", "\n")
         st.insert("end", "PULSES       ", "dim")
         st.insert("end", f"total={ptot}  interval={pint}\n", "bright")

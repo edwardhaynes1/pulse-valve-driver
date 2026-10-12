@@ -249,6 +249,12 @@ def main():
         print(f"Upstream traces smoothed with a {args.smooth}-row moving average "
               f"(plot-time only; log is raw)")
     vac       = [to_float(r["vacuum_chamber_mbar"]) for r in rows]
+    # Logs from the driver's validity check leave the vacuum cell blank and
+    # say why in vacuum_status; older logs have no such column.
+    n_invalid = sum(1 for r in rows if (r.get("vacuum_status") or "").strip())
+    if n_invalid:
+        print(f"Vacuum: {n_invalid} of {len(rows)} rows had no valid gauge "
+              f"reading (vacuum_status) and are left out of the vacuum trace")
     if args.gauge_floor and args.gauge_floor > 0:
         n_off = sum(1 for v in vac if v is not None and v < args.gauge_floor)
         if n_off:
