@@ -173,7 +173,7 @@ CAPTURE_RESOLUTION  = 0        # U3 stream resolution index (0 = best noise)
 CAPTURE_PRE_S       = 1.0      # baseline recorded before the pulse (s)
 CAPTURE_POST_S      = 5.0      # transient + tail recorded after the pulse (s)
 CAPTURE_DECIMATE    = 10       # samples averaged per analysis point
-CAPTURE_SETTLE_S    = 3.0      # pause between shots in a multi-shot run (s)
+CAPTURE_SETTLE_S    = 10.0      # pause between shots in a multi-shot run (s)
 STREAM_SELFTEST_S   = 0.75     # sustained self-test span per rate rung (s)
 
 # ─── Paired-pulse test (pp) ───────────────────────────────────────────────────
