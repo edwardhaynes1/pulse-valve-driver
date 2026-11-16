@@ -2,8 +2,9 @@
 """
 PULSE-VALVE-DRIVER.py
 ===============
-Logs upstream pressure and temperature from a Keller PAA-23SX-H2 sensor,
-and allows manual *and* automatic (independent) control of a ZC1 pulse valve controller.
+Logs downstream (vacuum chamber) pressure from a Balzers IKR 270 cold-cathode gauge (via the LabJack U3, FIO2), 
+upstream pressure and temperature from a Keller PAA-23SX-H2 sensor,
+and allows control of a ZC1 pulse valve controller.
 
 This version presents a TWO-WINDOW GUI (Tkinter, standard library):
   • "Live Log"      — device status, live readouts, pressure strip chart,
@@ -17,6 +18,7 @@ This version presents a TWO-WINDOW GUI (Tkinter, standard library):
 
 Hardware
 --------
+  Balzers IKR 270       Cold-cathode pressure gauge
   Keller PAA-23SX-H2   RS485/USB (K-114 adapter) — upstream P + T
   ZC1 controller       USB-RS232 — pulse valve control
   LabJack U3 (opt.)    vacuum chamber gauge on FIO2
@@ -50,11 +52,11 @@ Driver commands
 Capture outputs
 ---------------
   logs/pulse_<ts>.csv        one file per shot: full decimated trace, t = 0 at
-                             fire, with peak / dp / integral / tau / S_eff / Q
-                             in the header
-  logs/pvd-captures_<ts>.csv one row per shot for the whole session — a manifest
-                             indexing every capture (single or multi-shot, any
-                             rate), so scatter / tau / regression work needs one
+                             fire, with peak / dp / integral / t_eq /
+                             tau_return in the header
+  logs/pvd-captures_<ts>.csv one row per shot for the whole session — the capture
+                             log, indexing every capture (single or multi-shot, any
+                             rate), so scatter / tau_return / regression work needs one
                              file, not dozens. Each row's trace_file points back
                              to its full per-shot trace.
 
@@ -98,7 +100,7 @@ except ImportError:
 # ═══════════════════════════════════════════════════════════════════════════════
 # CONFIGURATION
 # ═══════════════════════════════════════════════════════════════════════════════
-# LabJack vacuum gauge (FIO2, analogue) — Pfeiffer IKR 270 cold cathode gauge
+# LabJack vacuum gauge (FIO2, analogue) — Balzers IKR 270 cold cathode gauge
 # behind a voltage divider. Gauge characteristic (manual, Appendix A):
 #   p [mbar] = 10 ** (1.25 * U_gauge - 12.75)   valid for U_gauge 1.96 … 8.6 V
 # The LabJack sees V = U_gauge / VACUUM_DIVIDER_RATIO, so the slope per
@@ -140,7 +142,7 @@ FIRE_SNAPSHOT_N    = 5          # recent Keller samples median-ed for the at-fir
 ZC1_BAUD           = 38400
 ZC1_PORT           = None       # None = auto-detect
 LOG_INTERVAL_S     = 0.5        # seconds between logged rows (drift-free)
-DEFAULT_OPEN_US    = 1600       # µs — matches current ZC1 setting
+DEFAULT_OPEN_US    = 85         # µs — default open time, sent to the ZC1 at startup
 
 DEFAULT_DRIVE_HZ   = 1.0        # automatic pulse repetition rate (Hz)
 DRIVE_HZ_MIN       = 0.01       # clamp: slowest auto-drive rate
@@ -171,7 +173,7 @@ LOG_DIR            = str(Path(__file__).parent / "logs")
 CAPTURE_RATE_LADDER = (5000, 2500, 2000, 1000, 500)   # Hz, fastest first
 CAPTURE_RESOLUTION  = 0        # U3 stream resolution index (0 = best noise)
 CAPTURE_PRE_S       = 1.0      # baseline recorded before the pulse (s)
-CAPTURE_POST_S      = 5.0      # transient + tail recorded after the pulse (s)
+CAPTURE_POST_S      = 30.0      # transient + tail recorded after the pulse (s)
 CAPTURE_DECIMATE    = 10       # samples averaged per analysis point
 CAPTURE_SETTLE_S    = 10.0      # pause between shots in a multi-shot run (s)
 STREAM_SELFTEST_S   = 0.75     # sustained self-test span per rate rung (s)
@@ -193,9 +195,6 @@ PAIR_FIT_TAU_S      = (1e-4, 10.0)   # tau search range for the recovery fit (s)
 PAIR_A_MIN          = 0.05     # smallest drop in the second dose counted as depletion
                                # (B); below it, or within 2 SE of zero, it is A
 
-CHAMBER_VOLUME_L    = 15.586   # geometric estimate (5 combined cylinders); consistent
-                               # with measured tau ~161 ms if pump line is DN63+.
-                               # Pending final pump-line-diameter check vs Cornelia's 5 L.
 CHAMBER_LIMIT_MBAR  = 1.0e-6   # the in-chamber limit being demonstrated against
 
 # ─── Run identity (what physically produced these captures) ────────────────────
@@ -219,18 +218,18 @@ CHAMBER_LIMIT_MBAR  = 1.0e-6   # the in-chamber limit being demonstrated against
 # Upstream *pressure* is deliberately NOT here: it is read live from the Keller
 # and stamped at the fire instant, so it can never go stale. (Distinct from the
 # upstream capillary geometry above, which is a fixed hardware fact.)
-DEFAULT_DOWNSTREAM_CAP_ID_UM  = 50.0    # downstream limiter bore, micrometres
-DEFAULT_DOWNSTREAM_CAP_LEN_MM = 100.0   # downstream limiter length, millimetres
-DEFAULT_UPSTREAM_CAP_ID_UM    = 0.0     # 0 = no upstream capillary fitted
-DEFAULT_UPSTREAM_CAP_LEN_MM   = 0.0     # 0 = no upstream capillary fitted
+DEFAULT_DOWNSTREAM_CAP_ID_UM  = 180.0   # downstream limiter bore, micrometres
+DEFAULT_DOWNSTREAM_CAP_LEN_MM = 200.0   # downstream limiter length, millimetres
+DEFAULT_UPSTREAM_CAP_ID_UM    = 300.0   # 0 = no upstream capillary fitted
+DEFAULT_UPSTREAM_CAP_LEN_MM   = 60.0    # 0 = no upstream capillary fitted
 DEFAULT_GAS_SPECIES      = "N2"    # gas at the valve. RECORDED ONLY — the gauge conversion
                                    # still assumes N2/air; apply the species factor
                                    # (H2~2.4, He~5.9, Ar~0.8) downstream, not here.
 
-FIT_NOISE_K            = 5.0   # stop the decay fit at this x baseline noise
-FIT_MIN_DYNAMIC_RANGE  = 20.0  # need peak excess this far above the noise floor
-FIT_START_FRACTIONS    = (0.7, 0.5, 0.35, 0.25, 0.15)  # candidate fit starts
-FIT_MIN_POINTS         = 20    # minimum points for a candidate fit to count
+RETURN_FIT_NOISE_K           = 5.0   # stop the return-curve fit at this x baseline noise
+RETURN_FIT_MIN_DYNAMIC_RANGE = 3.0   # fit only if peak excess is this far above the stop level
+RETURN_FIT_START_FRACTIONS   = (0.7, 0.5, 0.35, 0.25, 0.15)  # candidate fit starts
+RETURN_FIT_MIN_POINTS        = 20    # minimum points for a candidate fit to count
 
 # --- Pulse detection ---------------------------------------------------------
 # A capture always produces numbers. Without a test for whether anything
@@ -264,21 +263,21 @@ def _make_log_path():
 
 LOG_FILE = _make_log_path()
 
-# ─── Capture manifest ─────────────────────────────────────────────────────────
+# ─── Capture log ──────────────────────────────────────────────────────────────
 # One summary row per shot — single or multi-shot, any rate — appended to a
 # single per-session file. The bulky traces stay in their own per-shot
-# pulse_*.csv files; this manifest is the index across them, so all of a
-# session's captures sit in one table for scatter / tau / regression work
+# pulse_*.csv files; this capture log is the index across them, so all of a
+# session's captures sit in one table for scatter / tau_return / regression work
 # without opening dozens of files. `trace_file` on each row points back to the
 # full trace. The column set is FIXED (below): the detected, not-detected,
 # flat-trace and invalid-gauge cases each carry a different subset of fields, so a fixed schema
 # with blanks for the missing ones keeps every row aligned. Named to match the
 # session log's stamp so the pair is obvious: pvd-log_<ts> / pvd-captures_<ts>.
-MANIFEST_FILE = os.path.join(
+CAPTURE_LOG_FILE = os.path.join(
     LOG_DIR,
     "pvd-captures_" + os.path.basename(LOG_FILE)[len("pvd-log_"):])
 
-MANIFEST_COLUMNS = [
+CAPTURE_LOG_COLUMNS = [
     'capture_group_id', 'capture_shot_index', 'capture_group_size',
     'detected', 'flat_trace', 'gauge_invalid', 'invalid_samples',
     'capture_rate_hz', 'analysis_rate_hz',
@@ -291,40 +290,40 @@ MANIFEST_COLUMNS = [
     'p_base_mbar', 'baseline_sd_mbar',
     'peak_mbar', 'dp_mbar', 't_peak_s', 't_rise_10_90_s',
     'peak_snr', 'detect_t_stat', 'dp_upper_bound_mbar',
-    'integral_mbar_s',
-    'tau_s', 'r2', 's_eff_l_s', 'chamber_volume_l',
-    'q_pulse_mbar_l_integral', 'q_pulse_mbar_l_v_dp',
+    'integral_mbar_s', 't_eq_s',
+    'tau_return_s', 'return_fit_r2',
+    'return_fit_start_s', 'return_fit_start_frac',
     'samples_missed', 'trace_file',
 ]
 
-_manifest_lock = threading.Lock()   # captures are serialised on the LabJack
+_capture_log_lock = threading.Lock()   # captures are serialised on the LabJack
                                     # thread already; this is belt-and-braces.
 
 
-def append_manifest(meta: dict, trace_path):
-    """Append one summary row for a capture to MANIFEST_FILE.
+def append_capture_log(meta: dict, trace_path):
+    """Append one summary row for a capture to CAPTURE_LOG_FILE.
 
     Called for every shot that produced a file (detected, not-detected,
-    flat-trace and invalid-gauge alike), so the manifest is a complete record
+    flat-trace and invalid-gauge alike), so the capture log is a complete record
     of the session's captures — a non-detection is a real result (an upper bound), not nothing.
-    Uses the fixed MANIFEST_COLUMNS: unknown keys in *meta* are dropped and
+    Uses the fixed CAPTURE_LOG_COLUMNS: unknown keys in *meta* are dropped and
     missing ones written blank, so the four outcome shapes all append cleanly.
     The header is written only when the file is first created."""
     row = dict(meta)
     row['trace_file'] = os.path.basename(trace_path) if trace_path else ''
-    with _manifest_lock:
+    with _capture_log_lock:
         try:
-            new = (not os.path.exists(MANIFEST_FILE)
-                   or os.path.getsize(MANIFEST_FILE) == 0)
-            with open(MANIFEST_FILE, 'a', newline='') as f:
-                w = csv.DictWriter(f, fieldnames=MANIFEST_COLUMNS,
+            new = (not os.path.exists(CAPTURE_LOG_FILE)
+                   or os.path.getsize(CAPTURE_LOG_FILE) == 0)
+            with open(CAPTURE_LOG_FILE, 'a', newline='') as f:
+                w = csv.DictWriter(f, fieldnames=CAPTURE_LOG_COLUMNS,
                                    extrasaction='ignore', restval='')
                 if new:
                     w.writeheader()
                 w.writerow(row)
                 f.flush()
         except Exception as e:
-            log_event(f"MANIFEST: could not append row ({e})")
+            log_event(f"CAPTURE LOG: could not append row ({e})")
 
 
 # ─── Shared state ─────────────────────────────────────────────────────────────
@@ -948,8 +947,8 @@ def fire_pair(cycle_us: int, mark=None):
 #   peak            — the highest pressure the gauge actually saw
 #   dp              — peak above the pre-pulse baseline
 #   integral        — area under (p - baseline), for the throughput calculation
-#   tau, S_eff      — from the decay tail, if it is clean enough to fit
-#   Q_pulse         — gas per shot, by two independent routes (see below)
+#   tau_return      — time constant of the return to baseline after the peak,
+#                     from a fit to the return curve
 
 def _stream_selftest(lj, rate):
     """Configure and briefly run the stream at *rate*; True if it is clean.
@@ -1150,8 +1149,10 @@ def _decimate(values, factor):
             for i in range(0, len(values) - factor + 1, factor)]
 
 
-def _fit_decay(times, mbar, p_base, floor):
-    """Least-squares fit of ln(p - p_base) vs t over the usable tail.
+def _fit_return_curve(times, mbar, p_base, floor):
+    """Least-squares fit of ln(p - p_base) vs t over the return curve (the
+    pressure falling back to baseline after the peak). tau = -1/slope is
+    tau_return.
 
     Returns (tau, r2, n_points, t_start, start_frac) or None.
 
@@ -1180,11 +1181,11 @@ def _fit_decay(times, mbar, p_base, floor):
         return None
     i_peak = max(range(len(mbar)), key=lambda i: mbar[i])
     peak_excess = mbar[i_peak] - p_base
-    if peak_excess <= floor * FIT_MIN_DYNAMIC_RANGE:
+    if peak_excess <= floor * RETURN_FIT_MIN_DYNAMIC_RANGE:
         return None
 
     best = None
-    for start_frac in FIT_START_FRACTIONS:
+    for start_frac in RETURN_FIT_START_FRACTIONS:
         i_start = None
         for i in range(i_peak, len(mbar)):
             if (mbar[i] - p_base) <= start_frac * peak_excess:
@@ -1200,7 +1201,7 @@ def _fit_decay(times, mbar, p_base, floor):
                 break
             xs.append(t)
             ys.append(math.log(excess))
-        if len(xs) < FIT_MIN_POINTS:
+        if len(xs) < RETURN_FIT_MIN_POINTS:
             continue
 
         n = len(xs)
@@ -1285,7 +1286,7 @@ def _run_capture(lj, shot_index=1, group_id=None, group_size=1,
     shot_index / group_id / group_size tie the shots of one `c n` run together;
     they are stamped into the header and shared as a filename prefix.
     pair_dt_us fires a ZC1 two-shot series dt apart instead of one pulse (the
-    paired-pulse test); extra is stamped into the header and manifest.
+    paired-pulse test); extra is stamped into the header and capture log.
 
     Returns the shot's summary dict (with 'integral' in mbar*s) for a detected
     or not-detected shot, None if there is nothing to analyse."""
@@ -1371,7 +1372,7 @@ def _run_capture(lj, shot_index=1, group_id=None, group_size=1,
                     **_run_conditions(up_bar, up_degC),
                     'samples_missed': missed}
         path = _write_capture_csv(times, mbar, bad_meta, stem=stem)
-        append_manifest(bad_meta, path)
+        append_capture_log(bad_meta, path)
         log_event(f"CAPTURE{tag}: {os.path.basename(path)}")
         return None
     mbar = [_voltage_to_vacuum_mbar(v) for v in v_dec]
@@ -1381,12 +1382,12 @@ def _run_capture(lj, shot_index=1, group_id=None, group_size=1,
     guard = max(1, int(0.05 / dt))
     pre = mbar[:max(1, i_fire - guard)]
     p_base = sum(pre) / len(pre)
-    # Scatter on the pre-trigger baseline sets how far down the decay can be
+    # Scatter on the pre-trigger baseline sets how far down the return curve can be
     # followed. p_base itself is averaged over ~1 s, so it is known far better
     # than any single point.
     sd_pre = (math.sqrt(sum((p - p_base) ** 2 for p in pre) / len(pre))
               if len(pre) > 1 else p_base * 0.01)
-    fit_floor = FIT_NOISE_K * sd_pre
+    fit_floor = RETURN_FIT_NOISE_K * sd_pre
 
     post = mbar[i_fire:]
     i_pk_rel = max(range(len(post)), key=lambda i: post[i])
@@ -1420,21 +1421,24 @@ def _run_capture(lj, shot_index=1, group_id=None, group_size=1,
                 and t_stat >= DETECT_T_STAT)
 
     # Integral of the excess over the post-fire window, in mbar*s.
-    integral = sum(max(0.0, p - p_base) for p in post) * dt
+    integral = sum(p - p_base for p in post) * dt
 
-    fit = _fit_decay(times[i_fire:], post, p_base, fit_floor)
-    tau = s_eff = r2 = None
+    # Equivalent pulse duration: the length of a rectangular pulse with the
+    # same height (dp) and area (integral). Both scale with 1/pumping speed, so
+    # it largely cancels; t_eq is a property of the downstream capillary. It
+    # gives the sizing rule directly: dp = Q / (S * t_eq).
+    t_eq = integral / dp if dp > 0 else None
+
+    fit = _fit_return_curve(times[i_fire:], post, p_base, fit_floor)
+    tau = r2 = None
     fit_from = None
     if fit:
         tau, r2, npts, t_fit0, start_frac = fit
-        s_eff = CHAMBER_VOLUME_L / tau
         fit_from = (t_fit0, start_frac)
 
     # Rise time. For an impulsive injection this is set by the gauge (~10 ms).
     # Anything much longer means gas is still arriving well after the valve
-    # shut - which is exactly what a conductance limiter is for, but it breaks
-    # the V*dp route to Q_pulse, because not all the gas is ever in the
-    # chamber at once.
+    # shut - which is exactly what a conductance limiter is for.
     t10 = t90 = None
     for t, p in zip(times[i_fire:], post):
         if t10 is None and p >= p_base + 0.1 * dp:
@@ -1443,13 +1447,6 @@ def _run_capture(lj, shot_index=1, group_id=None, group_size=1,
             t90 = t
             break
     t_rise = (t90 - t10) if (t10 is not None and t90 is not None) else None
-
-    # Gas per pulse, two independent routes:
-    #   Q = V * dp          needs the volume, and the true peak
-    #   Q = S_eff * integral needs S_eff, but survives a rounded-off peak
-    # They lean on different estimates, so agreement is a real cross-check.
-    q_peak = CHAMBER_VOLUME_L * dp                      # mbar*L
-    q_int  = s_eff * integral if s_eff else None        # mbar*L
 
     # ---- reporting ----------------------------------------------------------
     if not trace_live:
@@ -1464,7 +1461,7 @@ def _run_capture(lj, shot_index=1, group_id=None, group_size=1,
                      **grp,
                      **_run_conditions(up_bar, up_degC)}
         path = _write_capture_csv(times, mbar, flat_meta, stem=stem)
-        append_manifest(flat_meta, path)
+        append_capture_log(flat_meta, path)
         return None
 
     if not detected:
@@ -1501,9 +1498,9 @@ def _run_capture(lj, shot_index=1, group_id=None, group_size=1,
             'samples_missed': missed,
         }
         path = _write_capture_csv(times, mbar, meta, stem=stem)
-        append_manifest(meta, path)
+        append_capture_log(meta, path)
         log_event(f"CAPTURE{tag}: {os.path.basename(path)}")
-        run = dict(meta, path=path, peak=None, tau=None, detected=False,
+        run = dict(meta, path=path, peak=None, tau_return=None, detected=False,
                    integral=integral)
         _capture_runs.append(run)
         return run
@@ -1517,21 +1514,16 @@ def _run_capture(lj, shot_index=1, group_id=None, group_size=1,
     if t_rise is not None:
         log_event(f"CAPTURE{tag}: rise 10-90% {t_rise*1000:.0f} ms "
                   f"(valve open {open_us} us)")
+    if t_eq is not None:
+        log_event(f"CAPTURE{tag}: t_eq {t_eq*1000:.0f} ms "
+                  f"(equivalent pulse duration = integral / dp)")
     if tau:
-        log_event(f"CAPTURE{tag}: tau {tau*1000:.1f} ms (r2 {r2:.4f}, "
-                  f"fit from {fit_from[0]*1000:.0f} ms)  S_eff {s_eff:.1f} L/s")
-        log_event(f"CAPTURE{tag}: Q_pulse {q_int:.3e} mbar.L (integral)  "
-                  f"{q_peak:.3e} (V.dp)")
-        if t_rise is not None and t_rise > 0.15 * tau:
-            log_event(f"CAPTURE{tag}: rise is {100*t_rise/tau:.0f}% of tau - "
-                      f"injection is not impulsive, trust the integral route")
-        elif q_int > 0 and not (0.5 < q_peak / q_int < 2.0):
-            log_event(f"CAPTURE{tag}: routes disagree by "
-                      f"{q_peak/q_int:.1f}x - check V and S_eff")
+        log_event(f"CAPTURE{tag}: tau_return {tau*1000:.0f} ms "
+                  f"(return-curve fit r2 {r2:.4f}, from {fit_from[0]*1000:.0f} ms)")
     else:
-        log_event(f"CAPTURE{tag}: pulse detected but no clean decay to fit")
-        log_event(f"CAPTURE{tag}: peak excess {dp:.2e} vs noise floor "
-                  f"{fit_floor:.2e} - too little range for tau; "
+        log_event(f"CAPTURE{tag}: pulse detected but the return curve could not be fitted")
+        log_event(f"CAPTURE{tag}: peak excess {dp:.2e} vs fit stop level "
+                  f"{fit_floor:.2e} - too little range for tau_return; "
                   f"peak and dp are still measured")
     if peak >= CHAMBER_LIMIT_MBAR:
         log_event(f"CAPTURE{tag}: *** PEAK EXCEEDED THE LIMIT ***")
@@ -1555,25 +1547,23 @@ def _run_capture(lj, shot_index=1, group_id=None, group_size=1,
         'dp_mbar': f"{dp:.6e}",
         't_peak_s': f"{t_peak:.4f}",
         't_rise_10_90_s': f"{t_rise:.4f}" if t_rise is not None else '',
-        'fit_start_s': f"{fit_from[0]:.4f}" if fit_from else '',
-        'fit_start_frac': fit_from[1] if fit_from else '',
         'integral_mbar_s': f"{integral:.6e}",
-        'tau_s': f"{tau:.6f}" if tau else '',
-        'r2': f"{r2:.5f}" if r2 else '',
-        'chamber_volume_l': CHAMBER_VOLUME_L,
-        's_eff_l_s': f"{s_eff:.3f}" if s_eff else '',
-        'q_pulse_mbar_l_integral': f"{q_int:.6e}" if q_int else '',
-        'q_pulse_mbar_l_v_dp': f"{q_peak:.6e}",
+        't_eq_s': f"{t_eq:.4f}" if t_eq is not None else '',
+        'tau_return_s': f"{tau:.6f}" if tau else '',
+        'return_fit_r2': f"{r2:.5f}" if r2 else '',
+        'return_fit_start_s': f"{fit_from[0]:.4f}" if fit_from else '',
+        'return_fit_start_frac': fit_from[1] if fit_from else '',
         'samples_missed': missed,
     }
     path = _write_capture_csv(times, mbar, meta, stem=stem)
-    append_manifest(meta, path)
+    append_capture_log(meta, path)
     log_event(f"CAPTURE{tag}: {os.path.basename(path)}")
 
     run = dict(meta)
     run['path'] = path
     run['peak'] = peak
-    run['tau'] = tau
+    run['tau_return'] = tau
+    run['t_eq'] = t_eq
     run['detected'] = True
     run['integral'] = integral
     _capture_runs.append(run)
@@ -1800,12 +1790,17 @@ def _summarise_runs(n_last):
     sd = math.sqrt(sum((p - mean) ** 2 for p in peaks) / (len(peaks) - 1))
     log_event(f"SUMMARY: {len(peaks)} shots  peak {mean:.3e} +/- {sd:.1e} mbar "
               f"({100*sd/mean:.1f}%)  max {max(peaks):.3e}")
-    taus = [r['tau'] for r in good if r['tau']]
+    taus = [r['tau_return'] for r in good if r['tau_return']]
     if len(taus) >= 2:
         tm = sum(taus) / len(taus)
         tsd = math.sqrt(sum((t - tm) ** 2 for t in taus) / (len(taus) - 1))
-        log_event(f"SUMMARY: tau {tm*1000:.1f} +/- {tsd*1000:.1f} ms  "
-                  f"S_eff {CHAMBER_VOLUME_L/tm:.1f} L/s")
+        log_event(f"SUMMARY: tau_return {tm*1000:.0f} +/- {tsd*1000:.0f} ms")
+    teqs = [r['t_eq'] for r in good if r.get('t_eq')]
+    if len(teqs) >= 2:
+        em = sum(teqs) / len(teqs)
+        esd = math.sqrt(sum((x - em) ** 2 for x in teqs) / (len(teqs) - 1))
+        log_event(f"SUMMARY: t_eq {em*1000:.0f} +/- {esd*1000:.0f} ms "
+                  f"({100*esd/em:.1f}%)")
     worst = max(peaks)
     log_event(f"SUMMARY: worst-case peak is "
               f"{100*worst/CHAMBER_LIMIT_MBAR:.1f}% of the "
@@ -2633,7 +2628,7 @@ def main():
         print("  [ZC1]    NOT FOUND — supervisor will keep scanning.")
 
     print(f"\nLogging to: {LOG_FILE}")
-    print(f"Capture manifest: {MANIFEST_FILE}")
+    print(f"Capture log: {CAPTURE_LOG_FILE}")
     print(f"Log cadence: every {LOG_INTERVAL_S:g} s (drift-free)")
     print("─" * 50)
 

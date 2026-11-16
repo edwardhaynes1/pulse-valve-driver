@@ -21,12 +21,12 @@ isolation valve → **pulse valve** → conductance limiter → vacuum chamber (
 
 - Single-shot pulse valve control via ZC1 controller over RS-232/USB
 - Real-time upstream pressure and temperature logging (Keller PAA series)
-- Vacuum chamber pressure logging via LabJack U3 (Pfeiffer IKR 270 behind a voltage divider)
+- Vacuum chamber pressure logging via LabJack U3 (Balzers IKR 270 behind a voltage divider)
 - **Pulse capture**: hardware-streamed chamber pressure through a single shot, with the valve fired automatically inside the capture window
-- Automatic analysis of each capture — peak, Δp, rise time, decay constant, effective pumping speed, gas delivered per pulse
+- Automatic analysis of each capture — peak, Δp, rise time, integral of the excess pressure, equivalent pulse duration (t_eq) and the time constant of the return to baseline (τ_return)
 - **Paired-pulse test** (`pp`): fires two pulses a set Δt apart, timed by the ZC1, to test whether the upstream capillary acts as a brake or as a reservoir that has to refill
 - **Run identity**: limiter bore/length and gas are recorded with every capture and row and can be changed live; upstream pressure and temperature are snapshotted at the fire instant
-- Single timestamped CSV per session with per-pulse events embedded inline (microsecond resolution), plus one CSV per capture and a per-session capture manifest summarising every shot in one table
+- Single timestamped CSV per session with per-pulse events embedded inline (microsecond resolution), plus one CSV per capture and a per-session capture log summarising every shot in one table
 - Auto-detection of serial devices on any COM port, with automatic reconnection if a device disconnects mid-session
 - Tkinter GUI: live readouts, three synchronised strip charts (upstream pressure, upstream temperature, vacuum chamber), and a valve driver terminal
 - Companion tools for plotting sessions, plotting single captures, re-analysing and plotting paired-pulse tests, and diagnosing the vacuum gauge
@@ -84,7 +84,7 @@ The open time in force is shown in the driver window, recorded in every session 
 
 The capillary geometry and the gas cannot be detected by any instrument — they change only when hardware is physically swapped. They are held as live settings, seeded at startup from the configuration block and changeable at any time with `cap` and `gas`. Whatever is in force is stamped into every subsequent capture header and session row.
 
-Two capillaries are recorded independently. The **downstream** one is the conductance limiter after the valve, into the chamber — it sets chamber conductance and shapes the decay, and the Gyger is never run without it, so it is always fitted. The **upstream** one is the feed capillary before the valve, on the reservoir side; it is not always present, and `cap up none` records that.
+Two capillaries are recorded independently. The **downstream** one is the conductance limiter after the valve, into the chamber — it sets chamber conductance and shapes the return to baseline, and the Gyger is never run without it, so it is always fitted. The **upstream** one is the feed capillary before the valve, on the reservoir side; it is not always present, and `cap up none` records that.
 
 ```
 cap down 50 100    # downstream: 50 µm bore, 100 mm (= 10 cm) long. NOTE: length is in mm.
@@ -126,7 +126,7 @@ Does gas flow freely through the upstream capillary during a pulse (**A**, the c
 Q2/Q1 = I_pair / I_single − 1        (I = integral of the excess pressure, mbar·s)
 ```
 
-The chamber volume and S_eff cancel, so the ratio needs no calibration. In A the second dose equals the first at every Δt; in B it is smaller at short Δt and recovers as the reservoir refills.
+The pumping speed cancels, so the ratio needs no calibration. In A the second dose equals the first at every Δt; in B it is smaller at short Δt and recovers as the reservoir refills.
 
 ```
 pp                       # the default sweep, PAIR_DT_MS
@@ -142,14 +142,14 @@ pp stop                  # end early; the pairs so far are summarised
 t_fill ≈ 32 μ L² / (d² p)        μ gas viscosity, L length, d bore, p upstream pressure
 ```
 
-(about 0.24 ms for a 300 µm × 60 mm capillary in N₂ at 0.9 bar). If t_fill is much shorter than the open time, the capillary reaches steady flow within the pulse and it is A by construction; the test is most informative at short open times and low upstream pressure, where t_fill is comparable to or longer than the open time. Choose Δt from just above the shortest allowed up to several times t_fill. The ZC1 needs Δt ≥ 300 µs and Δt ≥ open time + 100 µs, so at 1600 µs the shortest Δt is 1.7 ms, and at 82 µs it is 0.3 ms; values below the limit are dropped with a note.
+(about 0.24 ms for a 300 µm × 60 mm capillary in N₂ at 0.9 bar). If t_fill is much shorter than the open time, the capillary reaches steady flow within the pulse and it is A by construction; the test is most informative at short open times and low upstream pressure, where t_fill is comparable to or longer than the open time. Choose Δt from just above the shortest allowed up to several times t_fill. The ZC1 needs Δt ≥ 300 µs and Δt ≥ open time + 100 µs, so at 1600 µs the shortest Δt is 1.7 ms, and at 85 µs it is 0.3 ms; values below the limit are dropped with a note.
 
-- **Plan.** `PAIR_REPEATS` (8) rounds; each round visits every Δt once, in shuffled order, as a single shot followed by a pair. Every pair is compared with its own single taken seconds before it, so upstream drift cancels, and shuffling keeps drift across the run from looking like recovery with Δt. A run is `2 × PAIR_REPEATS × (number of Δt)` captures, each taking `CAPTURE_PRE_S + CAPTURE_POST_S + CAPTURE_SETTLE_S` (6 s + 15 s): six Δt values take about 34 minutes, the default eight about 45. Monitoring continues between captures.
-- **Settling.** The chamber must be back at baseline before each capture, or each capture sits on the previous one's tail and biases the ratio. With a slow limiter tail, 3 s is not enough; 15 s is (`CAPTURE_SETTLE_S`).
+- **Plan.** `PAIR_REPEATS` (8) rounds; each round visits every Δt once, in shuffled order, as a single shot followed by a pair. Every pair is compared with its own single taken seconds before it, so upstream drift cancels, and shuffling keeps drift across the run from looking like recovery with Δt. A run is `2 × PAIR_REPEATS × (number of Δt)` captures, each taking `CAPTURE_PRE_S + CAPTURE_POST_S + CAPTURE_SETTLE_S` (1 s + 30 s + 10 s = 41 s): six Δt values take about 66 minutes, the default eight about 87. Monitoring continues between captures.
+- **Settling.** The chamber must be back at baseline before each capture, or each capture sits on the previous one's tail and biases the ratio. With a slow limiter tail the 30 s window (`CAPTURE_POST_S`) covers the return, and `CAPTURE_SETTLE_S` (10 s) adds a pause before the next baseline.
 - **Timing by the ZC1.** The pair is the ZC1's own shot series: number of shots G = 2, CYCLE time C = Δt, fired with `Q`. Δt is therefore set by the ZC1's µs timer, not by the serial link. The CYCLE time read back from the ZC1 is what is recorded.
 - **Safety.** G powers up at its saved value (100 by default), and `Q` with G = 100 would fire 100 pulses. The driver sets G = 2 and reads it back before each pair, and reads it again immediately before sending `Q`; if it is not 2, nothing is fired and the pair is skipped. G is left at 2 afterwards.
-- **Output.** `pvd-pairtest_<ts>.csv` gets one row per pair as it completes (Δt asked for and in force, both integrals, Q2/Q1, upstream pressure at each fire, both trace files). At the end, `pvd-pairtest-summary_<ts>.csv` holds the driver's verdict, its fit and the run identity in its header, and the mean, standard deviation and standard error of Q2/Q1 per Δt. Every capture is also in the manifest, with `shots_per_fire`, `pair_dt_us`, `pairtest_dt_ms`, `pairtest_repeat` and `pairtest_role`.
-- **The driver's verdict is a quick look.** It fits `Q2/Q1 = 1 − a · exp(−Δt / τ)` to the mean per Δt and calls A if `a` is within 2 standard errors of zero or below `PAIR_A_MIN` (5 %). With few Δt values this two-parameter fit is barely constrained, and its integral clips noise below the baseline. **Quote the result from `PAIRTEST_PLOTTER.py`** (see *Companion tools*), which re-analyses every trace and decides from the shortest Δt alone.
+- **Output.** `pvd-pairtest_<ts>.csv` gets one row per pair as it completes (Δt asked for and in force, both integrals, Q2/Q1, upstream pressure at each fire, both trace files). At the end, `pvd-pairtest-summary_<ts>.csv` holds the driver's verdict, its fit and the run identity in its header, and the mean, standard deviation and standard error of Q2/Q1 per Δt. Every capture is also in the capture log, with `shots_per_fire`, `pair_dt_us`, `pairtest_dt_ms`, `pairtest_repeat` and `pairtest_role`.
+- **The driver's verdict is a quick look.** It fits `Q2/Q1 = 1 − a · exp(−Δt / τ)` to the mean per Δt and calls A if `a` is within 2 standard errors of zero or below `PAIR_A_MIN` (5 %). With few Δt values this two-parameter fit is barely constrained, and its integral uses a constant pre-fire baseline. **Quote the result from `PAIRTEST_PLOTTER.py`** (see *Companion tools*), which re-analyses every trace and decides from the shortest Δt alone.
 - **Control.** Repeat the test with the upstream capillary removed (`cap up none`). A change in the second dose without it comes from the valve or the ZC1, not from the capillary.
 
 A second dose *larger* than the first cannot be depletion. It points at the valve or the ZC1 (for example, a second opening while the armature or seat has not settled from the first), and the control run is the way to confirm it.
@@ -207,21 +207,20 @@ A commented header of derived values, then the decimated trace with `t = 0` at t
 | `p_base_mbar`, `baseline_sd_mbar` | Pre-trigger baseline and its scatter |
 | `peak_mbar`, `dp_mbar` | Peak pressure, and peak above baseline |
 | `t_peak_s`, `t_rise_10_90_s` | Time to peak, and 10–90 % rise time |
-| `integral_mbar_s` | Area under the excess, whole post-fire trace |
-| `tau_s`, `r2` | Decay constant and fit quality |
-| `fit_start_s`, `fit_start_frac` | Where the decay fit began |
-| `chamber_volume_l`, `s_eff_l_s` | Volume assumed, and V/τ |
-| `q_pulse_mbar_l_integral` | Gas per pulse, S_eff × integral |
-| `q_pulse_mbar_l_v_dp` | Gas per pulse, V × Δp |
+| `integral_mbar_s` | ∫Δp dt: signed sum of (p − baseline) × sample interval over the whole post-fire trace |
+| `t_eq_s` | Equivalent pulse duration, integral ÷ Δp |
+| `tau_return_s` | Time constant of the return to baseline, from the return-curve fit |
+| `return_fit_r2` | Quality of the return-curve fit |
+| `return_fit_start_s`, `return_fit_start_frac` | Where the return-curve fit began (time after fire, fraction of the peak excess) |
 | `samples_missed` | Stream samples dropped (should be 0) |
 
-The identity and upstream fields are written for **every** outcome — including non-detections and flat-trace captures — so even a dud shot records what it was trying to do. Because the volume used is also recorded, any capture can be re-analysed with a better volume estimate later without retaking data.
+The identity and upstream fields are written for **every** outcome — including non-detections and flat-trace captures — so even a dud shot records what it was trying to do.
 
 ### `pvd-captures_<timestamp>.csv` — one per session
 
-A **manifest**: one summary row per shot, for every capture taken in the session — single shots and multi-shot runs alike, at any rate. It carries the same scalar fields as the per-capture headers above (peak, Δp, τ, S_eff, Q, detection statistics, run identity), plus a `trace_file` column pointing back to that shot's full trace.
+The **capture log**: one summary row per shot, for every capture taken in the session — single shots and multi-shot runs alike, at any rate. It carries the same scalar fields as the per-capture headers above (peak, Δp, integral, t_eq, τ_return, detection statistics, run identity), plus a `trace_file` column pointing back to that shot's full trace.
 
-Its purpose is comparison across shots. The scalars are what shot-to-shot scatter, τ-versus-bore and dose-versus-open-time work actually need, and gathering them here means one file to open rather than one per shot with a header to parse each time:
+Its purpose is comparison across shots. The scalars are what shot-to-shot scatter, t_eq-versus-capillary and integral-versus-open-time work actually need, and gathering them here means one file to open rather than one per shot with a header to parse each time:
 
 ```python
 import pandas as pd
@@ -231,36 +230,31 @@ df[df.detected == 1].groupby("open_time_us").peak_mbar.agg(["mean", "std", "coun
 
 Its timestamp matches the session log's, so `pvd-log_<ts>.csv` and `pvd-captures_<ts>.csv` are an obvious pair. Rows are appended as each shot completes, so the file is usable mid-run and survives an interrupted session.
 
-Every shot is recorded, including non-detections (where `dp_upper_bound_mbar` carries the upper bound instead of a peak) flat-trace faults (`flat_trace = 1`) and captures with gauge readings that are not valid (`gauge_invalid = 1`, with the count in `invalid_samples`), so the manifest is a complete account of the session rather than only its successes. The column set is fixed and the four outcome types write blanks for fields that don't apply, so every row aligns.
+Every shot is recorded, including non-detections (where `dp_upper_bound_mbar` carries the upper bound instead of a peak) flat-trace faults (`flat_trace = 1`) and captures with gauge readings that are not valid (`gauge_invalid = 1`, with the count in `invalid_samples`), so the capture log is a complete account of the session rather than only its successes. The column set is fixed and the four outcome types write blanks for fields that don't apply, so every row aligns.
 
-**Traces stay where they are.** The manifest holds scalars only; the dense time series remain in their own per-shot `pulse_*.csv` files. The two have genuinely different shapes — one row per shot versus a few thousand rows per shot — and merging them would swamp the summary that makes the manifest useful, so the manifest indexes the traces rather than absorbing them.
+**Traces stay where they are.** The capture log holds scalars only; the dense time series remain in their own per-shot `pulse_*.csv` files. The two have genuinely different shapes — one row per shot versus a few thousand rows per shot — and merging them would swamp the summary that makes the capture log useful, so the capture log indexes the traces rather than absorbing them.
 
 ---
 
 ## What the capture numbers mean
 
-**τ (tau)** — the decay time constant read from the shape of the tail alone. Every τ seconds, whatever excess pressure remains falls to 36.8 % of its previous value; practically, the chamber is back to baseline after about 5τ. **What τ represents depends on what is slowest.** With a wide, non-restrictive capillary, the tail is the chamber emptying through the pump, and τ = V/S_eff. With a restrictive one, the tail is the *capillary* bleeding its charge into the chamber, which can be seconds — far slower than the pump — so τ is then a capillary property, not a chamber-pumping one. The response is genuinely two-timescale in that case: a fast chamber-pumping component (τ_fast) sitting under a slow limiter-emptying tail (τ_slow). `PULSE-PLOTTER.py` fits both; the driver's onboard fit reports a single τ and, on a restrictive limiter, that single τ is the slow tail.
+**Δp(t) and Δp_peak.** Δp(t) is the chamber pressure minus the pre-fire baseline at each sample; Δp_peak is its highest value, the quantity the chamber limit applies to.
 
-**S_eff = V / τ** — the pumping speed the chamber actually experiences (the pump's nameplate degraded by everything between chamber and pump). Constant in molecular flow (below ~10⁻³ mbar), but species-dependent: an S_eff measured in N₂ does not transfer to H₂. **S_eff is only V/τ when τ is the chamber-pumping time.** On a restrictive-limiter shot the onboard `s_eff_l_s` is computed from the slow tail and will read several times too low. For those shots, trust τ_fast from `PULSE-PLOTTER.py`, or — better — measure S_eff once without a limiter and carry it as a fixed constant rather than re-deriving it from every pulse.
+**∫Δp dt (`integral_mbar_s`)** — the area under Δp(t) over the whole post-fire window, as a signed sum, so noise above and below the baseline cancels. The gas delivered is S × ∫Δp dt, with S the pumping speed. The driver does not estimate S, so the integral is proportional to the dose: valid for comparing shots taken close together, while the pumping speed has not changed. The integral is only right if the baseline is flat (the chamber has finished pumping down) and the window covers the whole return to baseline.
 
-**Q_pulse** — gas delivered per shot, in mbar·L. Computed two ways:
+**t_eq (`t_eq_s`)** — the equivalent pulse duration, ∫Δp dt ÷ Δp_peak: the width of a rectangle with the same height and the same area as the measured pulse. When the downstream capillary empties much more slowly than the chamber pumps out, the chamber pressure follows the flow out of the capillary, Δp(t) = q(t) / S. Then ∫Δp dt is the total gas ÷ S and Δp_peak is the peak outflow ÷ S, so t_eq is the total gas ÷ the peak outflow: how long the capillary would take to deliver the dose at its peak rate. The dose and the pumping speed largely cancel, so t_eq is a property of the downstream capillary. It gives the sizing rule directly: Δp_peak = Q / (S × t_eq), so a capillary keeps the peak below a limit Δp_allowed when t_eq ≥ Q / (S_min × Δp_allowed).
 
-- `S_eff × ∫p dt` — counts every molecule as the pump removes it, whenever it arrived
-- `V × Δp` — assumes all the gas is in the chamber at once
+**τ_return (`tau_return_s`)** — the time constant of the return to baseline after the peak, from a fit of ln Δp against time over the return curve. The fit is tried from several starting points along the curve (`RETURN_FIT_START_FRACTIONS`) and the best one is kept; `return_fit_start_s` and `return_fit_start_frac` record where it began. With a downstream capillary, the return is set by the capillary emptying, not by the pumping. The return is not exactly exponential, so treat τ_return as a comparison figure alongside t_eq, not as an exact constant. The fit runs only when Δp_peak exceeds `RETURN_FIT_MIN_DYNAMIC_RANGE` × `RETURN_FIT_NOISE_K` × the baseline standard deviation.
 
-Both scale linearly with the assumed volume, so their **ratio** is volume-independent and tests only the shape of the injection. If a limiter spreads the arrival over a time comparable to τ, the pump removes gas while it is still arriving, `V × Δp` under-reads, and the integral route is the one to use — but note the integral route multiplies by S_eff, so it inherits the S_eff caveat above: on a limiter shot, feed it τ_fast, not the tail. The driver warns when the rise exceeds 15 % of τ.
+**`return_fit_r2`** — how well a single exponential describes the fitted region. Values below about 0.98 mean more than one process is acting, which is expected with a capillary.
 
-Two further cautions with a limiter fitted. First, Q_pulse then characterises the **valve plus limiter plus dead volume**, not the valve alone — a restrictive limiter can back-pressure the valve during the open time and throttle how much gas is admitted, so the same valve setting delivers a different dose through a different bore. Second, the integral is only right if the tail is fully captured; see `CAPTURE_POST_S` below.
-
-**r²** — how well a single exponential describes the fitted region. An exponential is a straight line on a log axis, so r² is measuring straightness. Values below ~0.98 suggest more than one process is acting — which is expected for a limiter (fast + slow), and is the cue to use the two-timescale fit rather than a single τ.
-
-**Sustained rate.** For continuous pulsing at rate f, the steady-state mean elevation above baseline is `p = Q_pulse × f / S_eff`, useful for finding the rate at which a chamber-pressure limit is reached. With a limiter there is a second, often tighter limit: **pulse pile-up.** Fire faster than about 1/5τ and one pulse's tail has not cleared before the next fires, so shots overlap and can no longer be resolved. With τ of a few seconds this caps clean single-shot work well below the mean-pressure limit.
+**Sustained rate.** For continuous pulsing at rate f, the mean elevation above baseline is Q × f / S. With a capillary there is a second, often tighter limit: fire faster than about 1 / (5 τ_return) and one pulse's tail has not cleared before the next fires, so shots overlap and can no longer be resolved.
 
 ---
 
 ## Historic data (files written before August 2026)
 
-The output schema changed on 2026-08-11. Older files differ in four ways: the session log was named `pvd-sensor_<ts>.csv` rather than `pvd-log_<ts>.csv`, the capillary columns were `capillary_id_um` / `capillary_length_mm` rather than `downstream_cap_*`, no upstream capillary was recorded at all, and no capture manifest was written.
+The output schema changed on 11.08.2026. Older files differ in four ways: the session log was named `pvd-sensor_<ts>.csv` rather than `pvd-log_<ts>.csv`, the capillary columns were `capillary_id_um` / `capillary_length_mm` rather than `downstream_cap_*`, no upstream capillary was recorded at all, and no capture log was written.
 
 **Raw log files are never edited.** A `pvd-log_*.csv` or `pulse_*.csv` is an acquisition record — what the instrument wrote, when it wrote it. Editing one after the fact erases the distinction between what was measured at the time and what was inferred later, and any mistake in the edit is silent.
 
@@ -268,6 +262,7 @@ Reading older files:
 
 - **`capillary_*` and `downstream_cap_*` are the same quantity**, renamed. Map the column name when reading; the values are directly comparable across the change.
 - **The upstream capillary is unknown** for anything written before the change — it was not recorded, so treat it as unknown rather than assuming none was fitted.
+- **Files written before 16.11.2026** have `tau_s`, `r2`, `fit_start_s`, `fit_start_frac`, `chamber_volume_l`, `s_eff_l_s`, `q_pulse_mbar_l_integral` and `q_pulse_mbar_l_v_dp`. `tau_s` and `r2` are the same quantities as `tau_return_s` and `return_fit_r2`. `s_eff_l_s` and both `q_pulse_*` columns were computed from V/τ and V × Δp and read low with a downstream capillary; do not use them. `t_eq_s` can be recomputed as `integral_mbar_s` ÷ `dp_mbar`. Earlier driver versions summed only the excess above the baseline, which overstates the integral; where it is not certain which version wrote a file, recompute the integral from the trace.
 - **The downstream value is only as good as the session's discipline.** It reflects whatever `cap` was last set to, which may be the startup default rather than what was actually installed. Where it matters, check it against the lab notebook rather than trusting the column outright.
 
 ---
@@ -322,7 +317,7 @@ Edit the `CONFIGURATION` block at the top of `PULSE-VALVE-DRIVER.py`:
 ```python
 KELLER_PORT        = None       # None = auto-detect, or e.g. "COM15"
 ZC1_PORT           = None       # None = auto-detect, or e.g. "COM18"
-DEFAULT_OPEN_US    = 1600       # default valve open time (µs)
+DEFAULT_OPEN_US    = 85         # default valve open time (µs), sent to the ZC1 at startup
 LOG_INTERVAL_S     = 0.5        # sensor log cadence (s)
 KELLER_POLL_HZ     = 4          # Keller sampling rate (Hz)
 FIRE_SNAPSHOT_N    = 5          # recent Keller samples median-ed for the at-fire snapshot
@@ -330,33 +325,34 @@ DISPLAY_SMOOTH_S   = 1.0        # live strip-chart / readout smoothing, seconds 
 
 CAPTURE_RATE_LADDER = (5000, 2500, 2000, 1000, 500)   # Hz, fastest first
 CAPTURE_PRE_S       = 1.0       # baseline recorded before the pulse (s)
-CAPTURE_POST_S      = 5.0       # transient + tail recorded after (s)
+CAPTURE_POST_S      = 30.0      # transient + tail recorded after (s)
 CAPTURE_DECIMATE    = 10        # samples averaged per analysis point
-CAPTURE_SETTLE_S    = 15.0      # pause between captures in a multi-shot run or pp test (s)
+CAPTURE_SETTLE_S    = 10.0      # pause between captures in a multi-shot run or pp test (s)
 
 PAIR_DT_MS          = (1, 2, 3, 5, 10, 20, 50, 100)   # pp default Δt sweep (ms)
 PAIR_REPEATS        = 8         # pairs per Δt in a pp test
 
-CHAMBER_VOLUME_L    = 15.586    # chamber volume, for S_eff and Q_pulse
 CHAMBER_LIMIT_MBAR  = 1.0e-6    # limit being demonstrated against
 
+RETURN_FIT_MIN_DYNAMIC_RANGE = 3.0   # fit the return curve only if the peak is this far above the stop level
+
 # ── Run identity (seeds the live cap / gas settings at startup) ──
-DEFAULT_DOWNSTREAM_CAP_ID_UM  = 50.0    # downstream capillary bore (µm)
-DEFAULT_DOWNSTREAM_CAP_LEN_MM = 100.0   # downstream capillary length (mm)
-DEFAULT_UPSTREAM_CAP_ID_UM    = 0.0     # 0 = no upstream capillary fitted
-DEFAULT_UPSTREAM_CAP_LEN_MM   = 0.0     # 0 = no upstream capillary fitted
+DEFAULT_DOWNSTREAM_CAP_ID_UM  = 180.0   # downstream capillary bore (µm)
+DEFAULT_DOWNSTREAM_CAP_LEN_MM = 200.0   # downstream capillary length (mm)
+DEFAULT_UPSTREAM_CAP_ID_UM    = 300.0   # 0 = no upstream capillary fitted
+DEFAULT_UPSTREAM_CAP_LEN_MM   = 60.0    # 0 = no upstream capillary fitted
 DEFAULT_GAS_SPECIES           = "N2"    # gas at the valve (recorded only)
 ```
 
-`CHAMBER_VOLUME_L` should be set from CAD before quoting S_eff or Q_pulse. The run-identity defaults are only a starting point — change the installed capillary and gas at runtime with `cap` / `gas` rather than editing and relaunching.
+The run-identity defaults are only a starting point — change the installed capillary and gas at runtime with `cap` / `gas` rather than editing and relaunching.
 
-`CAPTURE_POST_S` should be at least 5τ so the tail is fully captured. The default of 5 s suits an unlimited chamber (τ ~ 0.1–0.2 s), but a restrictive limiter can push τ to several seconds, needing 20–30 s; if the trace has not returned to baseline by the end of the window, the integral (and hence Q_pulse) is truncated low. Raise `CAPTURE_POST_S` for limiter work.
+`CAPTURE_POST_S` should be at least 5 τ_return so the return to baseline is fully captured. The default of 30 s covers capillaries with τ_return up to about 6 s; if the trace has not returned to baseline by the end of the window, the integral (and hence t_eq) is truncated low.
 
 ---
 
 ## Vacuum gauge calibration
 
-The chamber gauge is a Pfeiffer IKR 270 cold cathode gauge, read on LabJack FIO2 through a voltage divider — the same gauge, divider and conversion as the TE-valve driver. The gauge characteristic is
+The chamber gauge is a Balzers IKR 270 cold cathode gauge, read on LabJack FIO2 through a voltage divider — the same gauge, divider and conversion as the TE-valve driver. The gauge characteristic is
 
 ```
 log10(P / mbar) = 1.25 × U_gauge − 12.75        (valid for U_gauge 1.96 … 8.6 V)
@@ -367,7 +363,7 @@ so `log10(P / mbar) ≈ 4.044 × V_LabJack − 12.75`. The divider ratio was cal
 
 FIO2 is read on the U3-LV's special 0–3.6 V range (`VACUUM_AIN_SPECIAL`), both in monitoring and in capture streaming. With the divider, the gauge's full 8.6 V maps to 2.66 V, which the normal 0–2.44 V range would clip at about 1–2e-3 mbar. See `VACUUM-DIAG.py` for a standalone diagnostic.
 
-**Readings that are not pressures are not recorded as pressures.** A reading is not valid when the LabJack input is at or above `LABJACK_AIN_SAT_V` (clipped), or when the gauge-side voltage (LabJack volts × divider) is below `VACUUM_GAUGE_ERROR_V` (0.5 V: sensor error or no supply), below `VACUUM_GAUGE_MIN_V` (1.96 V: underrange or not yet ignited) or above `VACUUM_GAUGE_MAX_V` (8.6 V: overrange, > 1e-2 mbar) — the same ranges as the TE-valve driver. Such a reading is logged blank with the reason in `vacuum_status`, shown as `---` with the reason in the live readout, left out of the strip chart, and noted once in the event log when the gauge leaves and re-enters its valid range. A capture with any invalid sample is not analysed: its trace is written with those samples blank, the header and manifest carry `gauge_invalid = 1` and `invalid_samples`, and PULSE-PLOTTER skips it.
+**Readings that are not pressures are not recorded as pressures.** A reading is not valid when the LabJack input is at or above `LABJACK_AIN_SAT_V` (clipped), or when the gauge-side voltage (LabJack volts × divider) is below `VACUUM_GAUGE_ERROR_V` (0.5 V: sensor error or no supply), below `VACUUM_GAUGE_MIN_V` (1.96 V: underrange or not yet ignited) or above `VACUUM_GAUGE_MAX_V` (8.6 V: overrange, > 1e-2 mbar) — the same ranges as the TE-valve driver. Such a reading is logged blank with the reason in `vacuum_status`, shown as `---` with the reason in the live readout, left out of the strip chart, and noted once in the event log when the gauge leaves and re-enters its valid range. A capture with any invalid sample is not analysed: its trace is written with those samples blank, the header and capture log carry `gauge_invalid = 1` and `invalid_samples`, and PULSE-PLOTTER skips it.
 
 Gauge readings are gas-species dependent. The IKR 270's displayed value is calibrated for air/N₂; multiply by the manufacturer's factor for other species (H₂ ≈ 2.4, He ≈ 5.9, Ar ≈ 0.8). A 10⁻⁶ mbar limit in hydrogen therefore corresponds to a displayed ~4×10⁻⁷. The `gas_species` field records which gas was used, but the conversion above is **not** adjusted automatically — apply the factor when you analyse.
 
