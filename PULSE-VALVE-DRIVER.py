@@ -220,8 +220,8 @@ CHAMBER_LIMIT_MBAR  = 1.0e-6   # the in-chamber limit being demonstrated against
 # upstream capillary geometry above, which is a fixed hardware fact.)
 DEFAULT_DOWNSTREAM_CAP_ID_UM  = 180.0   # downstream limiter bore, micrometres
 DEFAULT_DOWNSTREAM_CAP_LEN_MM = 200.0   # downstream limiter length, millimetres
-DEFAULT_UPSTREAM_CAP_ID_UM    = 300.0   # 0 = no upstream capillary fitted
-DEFAULT_UPSTREAM_CAP_LEN_MM   = 60.0    # 0 = no upstream capillary fitted
+DEFAULT_UPSTREAM_CAP_ID_UM    = 1000.0   # 0 = no upstream capillary fitted
+DEFAULT_UPSTREAM_CAP_LEN_MM   = 50.0    # 0 = no upstream capillary fitted
 DEFAULT_GAS_SPECIES      = "N2"    # gas at the valve. RECORDED ONLY — the gauge conversion
                                    # still assumes N2/air; apply the species factor
                                    # (H2~2.4, He~5.9, Ar~0.8) downstream, not here.
